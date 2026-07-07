@@ -1,0 +1,14 @@
+{
+  "name": "necatisozer-wiki",
+  "description": "Local session-wiki + cross-session memory for Claude Code.",
+  "owner": {
+    "name": "Necati Sözer"
+  },
+  "plugins": [
+    {
+      "name": "wiki",
+      "source": "./",
+      "description": "Records sessions into a queryable markdown memory with keyword search and a SessionStart digest."
+    }
+  ]
+}
