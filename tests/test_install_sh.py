@@ -21,14 +21,14 @@ def fake_env(version=EXPECT, readd_version=EXPECT, listed=True, enabled=True, gh
     #                 clone fresh). EXPECT proves the auto-recover happy path; a wrong value
     #                 proves the loud-fail path.
     d = Path(tempfile.mkdtemp(prefix="fake5_"))
-    home = d / "home"; mp = home / ".claude" / "plugins" / "marketplaces" / "necatisozer-wiki"
+    home = d / "home"; mp = home / ".claude" / "plugins" / "marketplaces" / "claude-wiki"
     (mp / ".claude-plugin").mkdir(parents=True)
     manifest = mp / ".claude-plugin" / "plugin.json"
     manifest.write_text(json.dumps({"name": "wiki", "version": version}))
     # LIVE-VERIFIED shape of real `claude plugin list` output (checked against the claude CLI at
     # the pre-release gate): "  ❯ name@marketplace" line, then indented Version/Scope/Status
     # lines — Status ("✔ enabled" / "✘ disabled") sits 3 lines below, hence install.sh's grep -A3.
-    listing = ("  > wiki@necatisozer-wiki\n    Version: %s\n    Scope: user\n    Status: %s\n"
+    listing = ("  > wiki@claude-wiki\n    Version: %s\n    Scope: user\n    Status: %s\n"
                % (EXPECT, "enabled" if enabled else "disabled")) if listed else "none\n"
     log = d / "claude.log"
     readd_json = json.dumps({"name": "wiki", "version": readd_version})
@@ -98,7 +98,7 @@ env = fake_env(version="1.2.0", readd_version=EXPECT)
 r = run_sh(env)
 assert r.returncode == 0 and "ENGINE-CALLED init --yes" in r.stdout, r.stdout + r.stderr
 log = claude_log(env)
-assert "plugin marketplace remove necatisozer-wiki" in log, "recovery must remove the stale clone\n" + log
+assert "plugin marketplace remove claude-wiki" in log, "recovery must remove the stale clone\n" + log
 assert log.count("plugin marketplace add necatisozer/claude-wiki") == 2, \
     "recovery must re-add after remove\n" + log
 # LOUD-FAIL path: remove + re-add STILL yields the wrong version → loud error, exit non-zero,
@@ -107,7 +107,7 @@ env = fake_env(version="1.2.0", readd_version="1.2.0")
 r = run_sh(env)
 assert r.returncode == 1 and ("requires exactly %s" % EXPECT) in r.stderr, r.stdout + r.stderr
 assert "ENGINE-CALLED" not in r.stdout, "must never run an unknown engine\n" + r.stdout
-assert "plugin marketplace remove necatisozer-wiki" in claude_log(env), \
+assert "plugin marketplace remove claude-wiki" in claude_log(env), \
     "loud-fail must still have attempted recovery first\n" + claude_log(env)
 # EXACT match, not >=: a numerically-newer stale clone (pre-reset 1.10.0 beats 0.x forever)
 # must be rejected too — the old tuple-compare gate would have silently passed it.

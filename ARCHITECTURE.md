@@ -16,7 +16,7 @@ This split is the publish boundary — public code, private memory.
 | | `CODE_ROOT` | `DATA_DIR` (a.k.a. `WIKI_HOME`) |
 |---|---|---|
 | What | the shipped plugin (this public repo) | your private memory repo |
-| Where | `~/.claude/plugins/marketplaces/necatisozer-wiki/` | `~/.claude/wiki` (override with `$WIKI_HOME`) |
+| Where | `~/.claude/plugins/marketplaces/claude-wiki/` | `~/.claude/wiki` (override with `$WIKI_HOME`) |
 | Holds | engine, `prompts/`, `SCHEMA.md`, `hooks/`, `commands/`, `settings.json` | `pages/ journal/ state/ config.json index.md logs/` |
 | Visibility | public | **private** (your own GitHub repo) |
 

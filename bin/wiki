@@ -3051,13 +3051,13 @@ def _scrub_check():
 
 def _engine_for_hook():
     """A VERSION-STABLE engine path for the hook. The live engine lives in a VERSIONED cache dir
-    (…/cache/necatisozer-wiki/wiki/<version>/) — baking that would go stale on the next plugin
+    (…/cache/claude-wiki/wiki/<version>/) — baking that would go stale on the next plugin
     release, and git FAIL-CLOSES every push (engine's included) when a hook can't exec. The
     marketplace clone path is stable across releases on any device that installed the plugin.
     GUARD: a marketplace clone can also be a PRE-RELEASE checkout that predates this very command
     (e.g. still the version before `_scrub-check` shipped) — probe it on empty stdin before trusting
     it, else every push would fail-close forever with `unknown command: _scrub-check`."""
-    stable = HOME / ".claude" / "plugins" / "marketplaces" / "necatisozer-wiki" / "bin" / "wiki"
+    stable = HOME / ".claude" / "plugins" / "marketplaces" / "claude-wiki" / "bin" / "wiki"
     if stable.is_file():
         try:
             probe = subprocess.run([sys.executable, str(stable), "_scrub-check"],

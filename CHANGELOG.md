@@ -32,3 +32,10 @@ a later stability milestone.
   `wiki lint` checks corpus integrity.
 - POSIX-only engine, Python 3 stdlib only; one-line `install.sh` installer
   pinned to this release.
+
+### Changed
+
+- Marketplace renamed `necatisozer-wiki` → `claude-wiki` (2026-07-08, before any
+  external installs; the `v0.1.0` tag was re-cut to include this). The install
+  path is `~/.claude/plugins/marketplaces/claude-wiki/` and the plugin ID is
+  `wiki@claude-wiki`.

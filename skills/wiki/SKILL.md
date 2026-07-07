@@ -23,7 +23,7 @@ There is **no MCP server and no semantic/embedding search** — recall is three 
 
 ## Code vs data (two roots)
 - **Code** = the plugin (engine `bin/wiki`, `prompts/`, `SCHEMA.md`, the `hooks/` + `commands/`
-  manifests). Installed at `~/.claude/plugins/marketplaces/necatisozer-wiki/`. The engine calls this
+  manifests). Installed at `~/.claude/plugins/marketplaces/claude-wiki/`. The engine calls this
   `CODE_ROOT`. The editorial rulebook the engine inlines into ingest/lint is the **plugin's**
   `SCHEMA.md` (`CODE_ROOT/SCHEMA.md`) — the copy inside a memory repo, if any, is never read.
 - **Data** = your memory, at `~/.claude/wiki` (override with `$WIKI_HOME`). The engine calls this
@@ -46,7 +46,7 @@ Everything under **Commands** is the *manual* surface — you rarely need it.
 
 ## Commands
 Run in a session via the **`/wiki:wiki <cmd>`** command, or call the engine directly:
-`python3 ~/.claude/plugins/marketplaces/necatisozer-wiki/bin/wiki <cmd>`. Written `wiki <cmd>` below.
+`python3 ~/.claude/plugins/marketplaces/claude-wiki/bin/wiki <cmd>`. Written `wiki <cmd>` below.
 
 **Setup / sync (per machine)**
 - `wiki init [owner/repo | git-url] [--yes]` — one command, any machine state → this device synced.
@@ -146,7 +146,7 @@ upgrade), re-run `wiki init` (or `wiki _install-hook`).
 
 ## Uninstall (document-only — there is no `wiki uninstall`)
 Uninstalling is three explicit manual steps, by design (no teardown command that could get it wrong):
-1. `claude plugin uninstall wiki@necatisozer-wiki` — removes the engine, hooks, and command.
+1. `claude plugin uninstall wiki@claude-wiki` — removes the engine, hooks, and command.
 2. Remove the per-device pre-push hook if you set the repo's `core.hooksPath`:
    `git -C ~/.claude/wiki config --unset core.hooksPath` (skip if unset).
 3. **Optional and explicit:** delete the memory itself — `rm -rf ~/.claude/wiki` (local) and delete
