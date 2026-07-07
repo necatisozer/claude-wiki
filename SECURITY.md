@@ -29,7 +29,7 @@ has no independent copy to check against. Security-conscious users should **down
 first, inspect it, and run it locally**:
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/necatisozer/claude-wiki/main/install.sh
+curl -fsSLO https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.0/install.sh
 # read install.sh, then:
 bash install.sh
 ```

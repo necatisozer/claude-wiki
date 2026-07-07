@@ -81,7 +81,7 @@ Internal / scheduled (you won't normally type these): `record`, `digest`, `maint
 `backfill`, `ingest --if-due`, `lint --if-due`.
 
 **New machine?** `gh auth login`, then
-`curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/main/install.sh | bash`
+`curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.0/install.sh | bash`
 — or run `wiki init [owner/repo]` yourself after installing the plugin. The piped installer passes
 `--yes` (no TTY under curl|bash); download-then-run it for interactive confirms, or
 `… | bash -s -- owner/repo` to name the memory repo explicitly.
