@@ -1,9 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(~/.claude/plugins/marketplaces/necatisozer-wiki/bin/wiki query:*)",
-      "Bash(~/.claude/plugins/marketplaces/necatisozer-wiki/bin/wiki status:*)",
-      "Bash(~/.claude/plugins/marketplaces/necatisozer-wiki/bin/wiki doctor:*)",
+      "Bash(~/.claude/plugins/marketplaces/claude-wiki/bin/wiki query:*)",
+      "Bash(~/.claude/plugins/marketplaces/claude-wiki/bin/wiki status:*)",
+      "Bash(~/.claude/plugins/marketplaces/claude-wiki/bin/wiki doctor:*)",
       "Read(~/.claude/wiki/**)"
     ]
   }

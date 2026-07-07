@@ -118,9 +118,9 @@ currently inert. Until the platform honors it, copy the four rules into your **o
 {
   "permissions": {
     "allow": [
-      "Bash(~/.claude/plugins/marketplaces/necatisozer-wiki/bin/wiki query:*)",
-      "Bash(~/.claude/plugins/marketplaces/necatisozer-wiki/bin/wiki status:*)",
-      "Bash(~/.claude/plugins/marketplaces/necatisozer-wiki/bin/wiki doctor:*)",
+      "Bash(~/.claude/plugins/marketplaces/claude-wiki/bin/wiki query:*)",
+      "Bash(~/.claude/plugins/marketplaces/claude-wiki/bin/wiki status:*)",
+      "Bash(~/.claude/plugins/marketplaces/claude-wiki/bin/wiki doctor:*)",
       "Read(~/.claude/wiki/**)"
     ]
   }
@@ -134,7 +134,7 @@ permission prompt the first time each read command runs.
 ## Uninstall
 
 There is no `wiki uninstall` command (by design). To remove: `claude plugin uninstall
-wiki@necatisozer-wiki`, unset the repo's `core.hooksPath` if you set it, and — only if you want to —
+wiki@claude-wiki`, unset the repo's `core.hooksPath` if you set it, and — only if you want to —
 `rm -rf ~/.claude/wiki` and delete the private GitHub repo. Full steps are in
 [`skills/wiki/SKILL.md`](skills/wiki/SKILL.md).
 

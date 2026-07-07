@@ -1,5 +1,5 @@
 {
-  "name": "necatisozer-wiki",
+  "name": "claude-wiki",
   "description": "Local session-wiki + cross-session memory for Claude Code.",
   "owner": {
     "name": "Necati Sözer"
