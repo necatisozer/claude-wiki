@@ -187,6 +187,15 @@ def _reject_symlinked_path(fp):
     if fp.is_symlink():
         raise WriteRefused("refusing to write through a symlink target: %s" % fp)
     wiki_real = os.path.realpath(str(WIKI))
+    # Resolved-containment gate FIRST: os.path.realpath normalizes `..` and resolves symlinks in the
+    # existing prefix, so a `../`-laden target that only *lexically* passes back through WIKI (e.g. a
+    # companion slug `../../../../etc/evil`) resolves to its true location and is rejected here. The
+    # lexical parent-walk below CANNOT catch this alone — it returns "allowed" the moment it meets the
+    # literal WIKI component, which any `WIKI/…/../..` path reaches before the fs root. (Ancestor
+    # symlinks are still rejected by the walk; combined, lexical `..` == filesystem `..`.)
+    target_real = os.path.realpath(str(fp))
+    if target_real != wiki_real and not target_real.startswith(wiki_real + os.sep):
+        raise WriteRefused("target escapes WIKI: %s" % fp)
     cur = fp.parent
     while True:
         if os.path.realpath(str(cur)) == wiki_real:
@@ -1628,6 +1637,11 @@ def _split_oversized_page(relpath, text, maxlines):
     slug = fm.get("slug") or Path(relpath).stem
     if slug.endswith("-sources"):
         return text, None, None                          # never re-split a companion (no recursion)
+    if "/" in slug or ".." in slug or os.path.isabs(slug):
+        return text, None, None                          # a slug is a bare filename component; anything
+                                                         # path-shaped is malformed/hostile — never build a
+                                                         # companion write path from it (defense-in-depth; the
+                                                         # write guard also refuses the resolved escape)
     lines = text.split("\n")
     span = _sources_block_span(lines)
     if not span:
