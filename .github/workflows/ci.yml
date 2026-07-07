@@ -1,0 +1,14 @@
+# CI: full test suite on the SYSTEM python3 (the engine is stdlib-only by design — no setup-python).
+# Runners have no claude CLI, no gh auth, no git identity: the tests shim/skip all three.
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 tests/run.py

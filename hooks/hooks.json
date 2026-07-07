@@ -1,0 +1,26 @@
+{
+  "description": "Session-wiki: record each session at SessionEnd; inject the memory digest at SessionStart.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/wiki\" digest --hook",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/session_end_record.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
