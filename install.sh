@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # claude-wiki one-line installer: plugin install + memory init/restore.
-#   curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.0/install.sh | bash
 #   curl -fsSL … | bash -s -- owner/repo     # explicit memory repo (restore TARGET)
 # Non-interactive by necessity (curl|bash has no usable stdin) → passes --yes to `wiki init`.
 # For interactive confirms: download this file and run it directly.
