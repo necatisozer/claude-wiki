@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-07-18
+
+Patch release: security hardening follow-up and a secret-scanner false-positive fix.
+
+### Fixed
+
+- **Write guard soundness** — closed a companion-split path that could write
+  outside the data tree; the stage-then-promote write guard is now sound.
+- **Secret-scanner false positive** — the high-entropy detector no longer flags
+  long path segments that mix case and digits (e.g. the engine's own `source:`
+  transcript path or a quoted `feature/…/SomeCard.kt`). A run beginning right
+  after a `/` or `.` separator is a path segment, not a credential; real secrets
+  are preceded by `=`, `:`, quote, whitespace, or start-of-line. Standalone
+  high-entropy tokens are still detected. This unblocks legitimate session
+  journals that quote file paths from being held at the push gate.
+
 ## [0.1.0] - 2026-07-07
 
 First public release. Version numbers below 0.1.0 do not exist; prior 1.x

@@ -1,8 +1,8 @@
 # claude-wiki
 
-> ⚠️ **Pre-release — under construction.** This repo is being reworked toward its first supported
-> public release, **0.1.0** (security hardening, de-personalization, docs). Until that tag exists,
-> installing from `main` is unsupported and the history may be rewritten. Watch the releases page.
+> ⚠️ **Pre-stable (0.1.x).** The first public release has shipped; semver 0.x signals the API and
+> on-disk formats may still change before **1.0.0**. Install from the latest release tag (below), not
+> from `main`.
 
 A Claude Code plugin that gives Claude **persistent, cross-session memory**. A SessionEnd hook records
 what happened in each session into a private, git-backed markdown wiki; a SessionStart digest plus
@@ -14,7 +14,7 @@ run it on.
 
 ```
 gh auth login
-curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.0/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.1/install.sh | bash
 ```
 
 This installs the plugin, verifies the install actually took, and runs `wiki init` to set up your
@@ -26,7 +26,7 @@ it never falls back to anyone else's namespace. To restore from or create a spec
 it after `--`:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.0/install.sh | bash -s -- owner/repo
+curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.1/install.sh | bash -s -- owner/repo
 ```
 
 The piped one-liner always passes `--yes`, because a script arriving over a pipe has no terminal
@@ -34,7 +34,7 @@ attached for interactive confirmation prompts. Security-conscious users can insp
 it with a real stdin instead of piping it (the piped form cannot self-verify its own checksum):
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.0/install.sh
+curl -fsSLO https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.1/install.sh
 bash install.sh
 ```
 

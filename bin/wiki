@@ -2576,10 +2576,14 @@ SECRET_PATTERNS = [(n, re.compile(p)) for n, p in [
     # High-entropy catch-all: a >=32-char base64url-ish run that mixes lower + UPPER + digit. All
     # THREE classes are required, so a 40-hex git SHA (no uppercase), a UUID (no uppercase), and long
     # single-case base64 (no digit and/or no case mix) are EXCLUDED. '/' and '+' are NOT in the class
-    # so file paths / base64-with-slash never trip it. Each lookahead is a single '*' (linear-time, no
-    # catastrophic backtracking) and scanner input is bounded upstream, so this stays O(len).
+    # so a whole path/base64-with-slash never matches as one run. The negative lookbehind ALSO excludes
+    # '/' and '.': a run that starts immediately after a path separator is a path SEGMENT (e.g. the
+    # engine's own `source: /Users/…/-Users-necatisozer--claude-wiki-<uuid>/…` line, or a quoted
+    # `feature/…/GenerationCard.kt`), not a standalone credential — a real secret is preceded by '=',
+    # ':', quote, whitespace, or start-of-line, never by '/' or '.'. Each lookahead is a single '*'
+    # (linear-time, no catastrophic backtracking) and scanner input is bounded upstream, so O(len).
     ("high_entropy",
-                    r"(?<![A-Za-z0-9_\-])"
+                    r"(?<![A-Za-z0-9_\-/.])"
                     r"(?=[A-Za-z0-9_\-]*[a-z])(?=[A-Za-z0-9_\-]*[A-Z])(?=[A-Za-z0-9_\-]*[0-9])"
                     r"[A-Za-z0-9_\-]{32,}"),
 ]]
