@@ -14,7 +14,7 @@ run it on.
 
 ```
 gh auth login
-curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.1/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.2/install.sh | bash
 ```
 
 This installs the plugin, verifies the install actually took, and runs `wiki init` to set up your
@@ -26,7 +26,7 @@ it never falls back to anyone else's namespace. To restore from or create a spec
 it after `--`:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.1/install.sh | bash -s -- owner/repo
+curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.2/install.sh | bash -s -- owner/repo
 ```
 
 The piped one-liner always passes `--yes`, because a script arriving over a pipe has no terminal
@@ -34,7 +34,7 @@ attached for interactive confirmation prompts. Security-conscious users can insp
 it with a real stdin instead of piping it (the piped form cannot self-verify its own checksum):
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.1/install.sh
+curl -fsSLO https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.2/install.sh
 bash install.sh
 ```
 

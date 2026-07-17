@@ -1,10 +1,14 @@
 # tests/test_install_sh.py — installer: syntax, pinned-release gate (exact-match + auto-recover),
 # exec/arg forwarding, gh preflight (fakes).
-import os, shutil, subprocess, tempfile, json
+import os, re, shutil, subprocess, tempfile, json
 from pathlib import Path
 from sync_util import ROOT
 SH = ROOT / "install.sh"
-EXPECT = "0.1.0"  # must match install.sh's EXPECT (the pinned release)
+# DERIVE the pinned version from install.sh itself so the test can never drift out of sync with a
+# release bump (a hardcoded literal here silently broke when EXPECT moved 0.1.0 -> 0.1.1).
+_m = re.search(r'(?m)^EXPECT="([^"]+)"', SH.read_text())
+assert _m, "could not find EXPECT=\"...\" in install.sh"
+EXPECT = _m.group(1)
 
 assert subprocess.run(["bash", "-n", str(SH)]).returncode == 0, "bash -n failed"
 

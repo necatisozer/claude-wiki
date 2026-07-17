@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-07-18
+
+Patch release: decouple the lint detection-net sensitivity from the security gate.
+
+### Changed
+
+- **Lint detection net is now high-precision, independent of the security gate.** The lint sweep
+  previously reused the record/ingest classifier's deliberately fail-closed shape checks over the
+  whole corpus, so ordinary developer notes flooded the report with false positives: every line
+  saying "you"/"your" and every mention of the word "injection" (Dependency Injection, SQL/host
+  injection) tripped the `injection` tag, and camelCase/underscore identifiers (Gradle task names,
+  C linker symbols) tripped `secret` via the high-entropy catch-all. Lint now uses its own narrower
+  detectors — `injection` flags only an actual instruction-override clause ("ignore/disregard/forget
+  … previous/prior/above"), and `secret` flags only the named high-confidence credential patterns
+  (not the high-entropy catch-all). `leak` is unchanged (already precise).
+- **The security gate is untouched.** `record`, `ingest`, and the push scan remain fully fail-closed
+  on bare second-person address, every imperative verb, and high-entropy runs — enforcement is
+  unchanged; only the retrospective lint *report* got quieter.
+
+### Fixed
+
+- `test_install_sh.py` now derives the pinned version from `install.sh` instead of hardcoding it, so
+  a release bump can't silently break the installer gate test again.
+
 ## [0.1.1] - 2026-07-18
 
 Patch release: security hardening follow-up and a secret-scanner false-positive fix.

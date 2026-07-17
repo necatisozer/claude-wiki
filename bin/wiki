@@ -1837,17 +1837,39 @@ def _spawn_detached(argv):
                      stdin=subprocess.DEVNULL, start_new_session=True)
 
 # ---------------------------------------------------------------- phase 3: weekly full-wiki lint sweep
+# Lint-only detectors — DELIBERATELY narrower than the record/ingest SECURITY gate, and used ONLY by
+# _lint_shape_tags below. The enforcement path (classify_record / _risky_shapes / _ingest_hold_reason)
+# is UNCHANGED and still fail-closed: it holds or rejects at WRITE time on bare second-person address,
+# every imperative verb, and the high-entropy catch-all. The lint net, by contrast, is a RETROSPECTIVE
+# report over content that already landed (or predates the gate) — there, flagging every line that says
+# "you" or every camelCase identifier is pure noise that buries the real findings. So lint flags only
+# HIGH-SIGNAL shapes:
+#   injection: an actual instruction-override clause ("ignore/disregard/forget … previous/prior/above")
+#              — the canonical prompt-injection signature — NOT bare 2nd-person ("you"/"your", ~1 in 3
+#              wiki lines) nor everyday dev imperatives ("run the build", "delete the row").
+#   secret:    only the NAMED high-confidence credential patterns (AKIA/sk-/ghp_/stripe/…), NOT the
+#              high_entropy catch-all, which fires on Gradle task names (linkPod…Arm64) and C linker
+#              symbols and cannot be distinguished from a token without real entropy analysis.
+#   leak:      the same structural CoT/tool-transcript scaffold check (_LEAK_RX is already precise).
+_LINT_INJECTION_RX = re.compile(
+    r"\b(?:ignore|disregard|forget)\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|earlier)\b",
+    re.I)
+
+def _lint_secret_tags(text):
+    """scan_secrets minus the high_entropy catch-all: the named, high-confidence credential patterns
+    only. Never returns raw matched text (scan_secrets masks)."""
+    return [(n, m) for (n, m) in scan_secrets(text) if n != "high_entropy"]
+
 def _lint_shape_tags(text):
-    """WP4 ROW 3 — DETECTION NET. Reuse the record-stage classifier's shape checks over content that
-    ALREADY landed (pages + journal), so junk/poison that predates the record classifier is still
-    surfaced. Returns a CONTENT-FREE list of failure CLASS words (never the matched text): 'secret'
-    (scan_secrets — masked already), 'injection' (_IMPERATIVE_RX — same shape the ingest risk gate and
-    record classifier reject), 'leak' (_LEAK_RX — chain-of-thought / tool-transcript scaffolding).
-    Lint only REPORTS these; it never edits or deletes (the net is detection, not enforcement)."""
+    """WP4 ROW 3 — DETECTION NET over content that ALREADY landed (pages + journal). Returns a
+    CONTENT-FREE list of failure CLASS words (never the matched text): 'secret', 'injection', 'leak'.
+    Uses the lint-only detectors above (see their rationale), NOT the stricter security-gate shapes,
+    so a corpus of ordinary dev notes doesn't drown the report in false positives. Lint only REPORTS;
+    it never edits or deletes (detection, not enforcement) — the security gate does the enforcing."""
     tags = []
-    if scan_secrets(text):
+    if _lint_secret_tags(text):
         tags.append("secret")
-    if _IMPERATIVE_RX.search(text or ""):
+    if _LINT_INJECTION_RX.search(text or ""):
         tags.append("injection")
     if _LEAK_RX.search(text or ""):
         tags.append("leak")
