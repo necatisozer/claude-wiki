@@ -40,6 +40,11 @@ for i, sample in enumerate([akia, sk_ant, ghp, pat, slack, pem, jwt, unq, conn,
 git_sha = "abcdef12" * 5                                  # 40-char lowercase hex SHA → no UPPER → no high_entropy
 uuidv4  = "-".join(["abcdef01", "abcd", "abcd", "abcd", "abcdef012345"])   # hex UUID → no UPPER
 lowb64  = "abcdefghijklmnop" * 3                          # 48-char lowercase → no digit/UPPER mix
+# path SEGMENTS that mix case+digit and exceed 32 chars but sit after a '/' or '.' separator:
+# the engine's own `source:` line and quoted code paths. A path is not a standalone credential.
+src_line = "source: /Users/necatisozer/.claude/projects/-Users-necatisozer--claude-wiki-" + \
+           "-".join(["950a4ee6", "5250", "400d", "ad4d", "e3417a75ec92"]) + "/sess.jsonl"
+code_path = "modified `feature/generation/ui/GenerationCardMenu2State.kt`, added state"
 for benign in [
     "val skipToken = tokenizer.next()",                   # 'token' not in assignment shape
     "password prompt shown to the user",
@@ -52,6 +57,8 @@ for benign in [
     uuidv4,                                               # a UUID MUST NOT trip high_entropy
     lowb64,                                               # long single-case base64 MUST NOT trip high_entropy
     "risk_live_" + "a" * 20,                              # 'sk_live_<20>' inside 'risk_' → stripe lookbehind blocks it
+    src_line,                                             # engine-written `source:` path slug MUST NOT trip high_entropy
+    code_path,                                            # quoted code path segment MUST NOT trip high_entropy
 ]:
     lines, rc = probe(benign)
     assert rc == 0, "false positive on: %r → %s" % (benign, lines)
