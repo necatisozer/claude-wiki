@@ -5,6 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-07-19
+
+Security & integrity release: fixes for the findings of a 15-agent audit of the
+pipeline. Each claim was re-verified against the code before fixing — two of the
+audit's correctness claims (unbounded digest, concurrent re-record overwrite) did
+not reproduce (the digest is hard-capped; re-record is already serialized under
+`record.lock`) and are noted here as checked-not-fixed.
+
+### Security
+
+- **Sync-boundary shape gate now blocks hook injection.** A compromised remote
+  could commit an executable file or a `.githooks/pre-push` into the memory repo;
+  because the repo sets `core.hooksPath=.githooks`, that hook would execute on the
+  engine's next git operation. The pull/restore shape gate now rejects any tracked
+  executable (`100755`) blob and any tracked `.githooks/` path, alongside the
+  existing symlink/submodule rejection.
+- **`init --restore` now validates the remote tree.** Restore previously ran
+  `git checkout` with no gate — the one path where a hostile remote's content
+  reached disk unchecked. It now runs the shape gate (pre-checkout) and the same
+  secret/size/UTF-8 content gates a pull clears; a failure drops `.git` and
+  refuses, restoring nothing.
+
+### Fixed
+
+- **Ledger never advances past a failed commit.** Auto-ingest and `ingest
+  --accept` now check the `git commit` result: on failure the ledger is left
+  untouched (sessions stay un-ingested) so a batch can't be marked folded with
+  nothing committed. The fold re-emits full page bodies, so a retry converges.
+- **Companion (`<slug>-sources`) pages are fold-safe.** The oversized-page split
+  now derives the companion path from the safe file-path stem, never the
+  model-authored `slug:` (which a crafted value could have aimed at another page's
+  companion); companions are excluded from the ingest selection index; and a
+  model-emitted `<slug>-sources` FILE-block is refused. This closes the case where
+  a fold deleted archived citations from a `-sources` page.
+- **`maintain` re-checks the schema version after `sync --rebase`** — a pull can
+  deliver a newer `config.json` from an upgraded device, which must not then be
+  compiled against by the older engine.
+- **Secret scanner** gains a Slack incoming-webhook pattern, covering the
+  highest-value real-world case of a credential carried as a URL path segment
+  (the residual class the high-entropy detector deliberately skips to avoid the
+  path-false-positive regression).
+
 ## [0.1.4] - 2026-07-19
 
 Patch release: two fixes born from live incidents — a stale-cache engine guard

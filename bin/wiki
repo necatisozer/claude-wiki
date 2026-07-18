@@ -1530,6 +1530,10 @@ def _build_page_index():
     lines, paths = [], []
     for p in sorted(glob.glob(str(WIKI / "pages" / "**" / "*.md"), recursive=True)):
         rel = os.path.relpath(p, WIKI)
+        if Path(rel).stem.endswith("-sources"):
+            continue   # v0.1.5: `<slug>-sources` companions are mechanical citation archives — never
+                       # fold targets (an ingest once selected one and "cleaned up" 53 archived
+                       # citations). Not offering them here keeps them out of the fold allowlist too.
         fm = parse_frontmatter(_read_capped(p, errors="replace"))
         desc = " ".join(str(fm.get("description") or fm.get("name") or "").split())   # collapse to one line
         paths.append(rel)
@@ -1631,6 +1635,10 @@ def _write_ingest_pages(result, allowlist):
         if (".." in relpath or not base.endswith(".md") or base == ".md"
                 or not (relpath.startswith("pages/topics/") or relpath.startswith("pages/projects/"))):
             log("ingest: skipped unsafe path", relpath); continue
+        if base[:-3].endswith("-sources"):
+            # v0.1.5: companions are written ONLY by _split_oversized_page — a model-emitted
+            # `<slug>-sources` block (new or overwrite) is refused so folds can never touch an archive.
+            log("ingest: REFUSED companion page write", relpath); continue
         fp = WIKI / relpath
         if fp.exists() and relpath not in allowlist:      # overwrite of a page outside the asked-to-touch set
             log("ingest: REFUSED overwrite outside allowlist", relpath); continue
@@ -1688,15 +1696,19 @@ def _split_oversized_page(relpath, text, maxlines):
     companion_text), or (text, None, None) when no split is needed/possible. Defensive: never raises."""
     if text.count("\n") + 1 <= maxlines:
         return text, None, None
+    # v0.1.5 (integrity-audit I4): the companion path derives from the FILE PATH stem, never the
+    # model-authored `slug:` frontmatter — a crafted slug on an allowlisted page could otherwise
+    # aim the companion write at ANOTHER page's `<slug>-sources.md`, an overwrite outside the
+    # batch's allowlist. The stem comes from `written` (already allowlist-vetted); frontmatter is
+    # used only for the human-facing companion title below.
     fm = parse_frontmatter(text)
-    slug = fm.get("slug") or Path(relpath).stem
+    slug = Path(relpath).stem
     if slug.endswith("-sources"):
         return text, None, None                          # never re-split a companion (no recursion)
     if "/" in slug or ".." in slug or os.path.isabs(slug):
-        return text, None, None                          # a slug is a bare filename component; anything
-                                                         # path-shaped is malformed/hostile — never build a
-                                                         # companion write path from it (defense-in-depth; the
-                                                         # write guard also refuses the resolved escape)
+        return text, None, None                          # belt-and-suspenders: never build a write path
+                                                         # from anything path-shaped (the write guard
+                                                         # also refuses the resolved escape)
     lines = text.split("\n")
     span = _sources_block_span(lines)
     if not span:
@@ -1862,7 +1874,14 @@ def _ingest_auto_batch(cfg, conn):
     slugs = ", ".join(sorted({os.path.splitext(os.path.basename(w))[0] for w in written}))
     for _, pp in rows:
         _flip_journal_ingested(pp)      # durable flag, committed with this batch (journal is in scope below)
-    git_commit_paths("ingest (auto): %d sessions → %s" % (len(rows), slugs), "pages", "index.md", "journal")
+    r = git_commit_paths("ingest (auto): %d sessions → %s" % (len(rows), slugs), "pages", "index.md", "journal")
+    if r.returncode != 0:
+        # v0.1.5 (integrity-audit I5): NEVER advance the ledger past a failed commit — written pages
+        # would sit uncommitted (invisible to digest/HEAD) while the ledger claims them folded. Leave
+        # everything for the next run: the fold re-emits full page bodies, so a retry converges.
+        log("ingest auto ERROR: git commit failed (%s) — ledger NOT advanced, will retry"
+            % (r.stderr or r.stdout or "").strip()[:200])
+        return 0
     for sid, _ in rows:
         conn.execute("UPDATE sessions SET ingested_at=?, ingested_by='auto' WHERE session_id=?",
                      (now_iso(), sid))
@@ -2398,6 +2417,8 @@ def cmd_maintain(args):
         if not schema_guard():   # WP4 ROW 4 — never compile against newer-than-engine data
             return 3
         _sync_pull()      # multi-device: rebase in others' work before compiling (no-op if sync off)
+        if not schema_guard():   # v0.1.5 (integrity-audit I1): the pull may have just delivered a
+            return 3             # NEWER config.json from an upgraded device — re-check before compiling
         reconcile_sessions(cfg)   # WP4 ROW 1: catch missed/errored sessions BEFORE ingest folds them
         ingest_if_due(cfg)     # daily
         lint_if_due(cfg)       # weekly (lints the freshly-ingested state)
@@ -2423,7 +2444,16 @@ def cmd_ingest(args):
         for sid in pend:
             r = conn.execute("SELECT page_path FROM sessions WHERE session_id=?", (sid,)).fetchone()
             if r: _flip_journal_ingested(r[0])   # durable flag, committed with the accept below
-        git_commit_paths("ingest: %d sessions → topics/projects" % len(pend), "pages", "index.md", "journal")
+        dirty = bool(git("status", "--porcelain", "--", "pages", "index.md", "journal").stdout.strip())
+        rc = git_commit_paths("ingest: %d sessions → topics/projects" % len(pend), "pages", "index.md", "journal")
+        if dirty and rc.returncode != 0:
+            # v0.1.5 (integrity-audit I3/I5): there WERE staged changes and the commit failed —
+            # accepting now would mark sessions folded with nothing landed. Keep the pending
+            # review intact and refuse. (A clean tree with rc!=0 is the hand-committed case:
+            # "nothing to commit" — the content is already in HEAD, marking is correct.)
+            print("accept FAILED: git commit did not land (%s) — batch left staged, nothing marked."
+                  % (rc.stderr or rc.stdout or "").strip()[:200])
+            return 1
         for sid in pend:
             conn.execute("UPDATE sessions SET ingested_at=?, ingested_by='ingest' WHERE session_id=?",
                          (now_iso(), sid))
@@ -2666,6 +2696,13 @@ SECRET_PATTERNS = [(n, re.compile(p)) for n, p in [
                     r"access[_-]?key)\s*[=:]\s*['\"]?[A-Za-z0-9/+_\-]{20,}"),
     ("conn_string", r"(?i)(?:postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp|https?)"
                     r"://[^:@/\s]+:[^@/\s]+@"),
+    # v0.1.5 — path-segment secret compensator (2026-07-17 review of the high-entropy `/.`-lookbehind
+    # trade-off): URL-userinfo creds and `?api_key=`-style params were ALREADY caught (conn_string /
+    # assignment above); the residual gap is bare secrets as path segments, which the entropy detector
+    # deliberately skips because paths ARE high-entropy. Cover the highest-value real-world instance
+    # (Slack incoming-webhook paths) by name; the generic path-segment case remains a documented
+    # trade-off — flagging every entropic path segment would re-open the 93-false-positive regression.
+    ("slack_webhook", r"hooks\.slack\.com/services/T[A-Z0-9]{5,}/B[A-Z0-9]{5,}/[A-Za-z0-9]{18,}"),
     # --- WP1 ROW 1: broadened provider coverage ---
     ("stripe_key",  r"(?<![A-Za-z0-9_])[sr]k_(?:live|test)_[0-9A-Za-z]{16,}"),  # Stripe sk_/rk_ live/test
     ("google_api",  r"(?<![A-Za-z0-9_])AIza[0-9A-Za-z_\-]{35}"),               # Google API key
@@ -3265,11 +3302,14 @@ def _pull_failed_file():
     return WIKI / "state" / "pull_failed"
 
 def _pulled_shape_findings():
-    """FILESYSTEM-SHAPE gate at the sync boundary (WP1 ROW 1): reject any tracked entry whose git
-    mode is a symlink (120000) or gitlink/submodule (160000) — the C1 delivery vector (a 2nd
-    device commits `pages/topics/x.md → ../../.githooks/pre-push`). Returns offending 'kind:path'
-    strings; empty = clean. CONTENT gates (secret/instruction/size/UTF-8) are a SEPARATE later
-    hook — see _post_pull_validate."""
+    """FILESYSTEM-SHAPE gate at the sync boundary (WP1 ROW 1 + v0.1.5): reject any tracked entry
+    whose git mode is a symlink (120000) or gitlink/submodule (160000) — the C1 delivery vector (a
+    2nd device commits `pages/topics/x.md → ../../.githooks/pre-push`) — plus, since v0.1.5, ANY
+    executable blob (100755) and ANY tracked path under `.githooks/`. The memory repo is data-only:
+    it must contain no executables at all, and `core.hooksPath` points at `.githooks/`, so a tracked
+    hook delivered by a compromised remote would execute on the engine's next git operation
+    (integrity-audit finding, confirmed 2026-07-19). Returns offending 'kind:path' strings; empty =
+    clean. CONTENT gates (secret/size/UTF-8) are a SEPARATE later hook — see _post_pull_validate."""
     bad = []
     for line in git("ls-files", "-s").stdout.splitlines():
         try:
@@ -3281,6 +3321,10 @@ def _pulled_shape_findings():
             bad.append("symlink:%s" % path)
         elif mode == "160000":
             bad.append("submodule:%s" % path)
+        elif mode == "100755":
+            bad.append("executable:%s" % path)
+        if path == ".githooks" or path.startswith(".githooks/"):
+            bad.append("hook:%s" % path)
     return bad
 
 def _pulled_changed_docs(before):
@@ -3676,11 +3720,31 @@ def _cmd_init_restore(target, yes, url, default_slug=None, _retried=False):
             _sh.rmtree(tmp, ignore_errors=True)
             print("init: clone failed: %s" % (r.stderr or "").strip()[:300]); return 1
         os.replace(tmp / ".git", WIKI / ".git")
+        # v0.1.5 (integrity-audit S2): restore previously ran `checkout -- .` with NO validation —
+        # the one boundary where a hostile remote's tree reached disk ungated. Gate the INDEX first
+        # (shape scan works pre-checkout: symlinks/executables/hooks never touch the tree at all),
+        # then run the same content gates a pull clears, over everything tracked. Fail → drop .git,
+        # leave the dir as found (empty but for state/logs), refuse loudly.
+        def _refuse(reason):
+            _sh.rmtree(str(WIKI / ".git"), ignore_errors=True)
+            print("init: REFUSED restore — %s\nThe remote repo looks unsafe or is not a wiki data "
+                  "repo; nothing was restored." % reason)
+            return 1
+        bad = _pulled_shape_findings()
+        if bad:
+            _sh.rmtree(tmp, ignore_errors=True)
+            return _refuse("unsafe file shapes in remote tree: %s" % ", ".join(bad[:8]))
         co = git("checkout", "--", ".")
         _sh.rmtree(tmp, ignore_errors=True)
         if co.returncode != 0:
             print("init: checkout failed (%s) — re-run `wiki init` to heal"
                   % (co.stderr or "").strip()[:200]); return 1
+        ok, reason = _post_pull_validate()        # before=None → gate EVERYTHING tracked under pages/journal
+        if not ok:
+            for entry in list(WIKI.iterdir()):     # undo the checkout: tree was verified empty pre-restore
+                if entry.name not in ("state", "logs", ".git"):
+                    _sh.rmtree(str(entry), ignore_errors=True) if entry.is_dir() else entry.unlink(missing_ok=True)
+            return _refuse(reason)
         return _finish_restore()
 
 def _cmd_init_restore_resume(target, yes):
