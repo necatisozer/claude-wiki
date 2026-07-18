@@ -83,20 +83,52 @@ print("ok 1: write guard rejects `..`-escape target, still allows in-tree writes
 
 # =============================================================================================
 # 2. THE BUG — an oversized page with a path-shaped `slug` must NOT spill a companion outside WIKI.
-#    _split_oversized_page returns no companion; _finalize_ingest_pages writes nothing to the canary.
+#    v0.1.5 (integrity-audit I4) hardened this further: the companion path is now derived from the
+#    SAFE FILE-PATH STEM, not the model `slug:` at all — so a `../`-slug page splits CORRECTLY into
+#    its own in-tree `victim-sources.md` (using the stem), and the canary stays empty either way.
 # =============================================================================================
 W, canary = fresh_wiki()
 victim_rel = "pages/topics/victim.md"
 (W / victim_rel).write_text(big_page(ESCAPE_SLUG))
 new, comp_rel, comp = wiki._split_oversized_page(victim_rel, (W / victim_rel).read_text(), 160)
-assert comp_rel is None and comp is None, "a path-shaped slug must yield NO companion: %r" % (comp_rel,)
+assert comp_rel == "pages/topics/victim-sources.md", \
+    "companion path must come from the file stem, ignoring the hostile slug: %r" % (comp_rel,)
 
 out = wiki._finalize_ingest_pages([victim_rel], {})
 assert list(canary.iterdir()) == [], "companion split must not escape WIKI: %r" % list(canary.iterdir())
-assert out == [victim_rel], "no out-of-tree companion may be appended to the written list: %r" % out
-# belt-and-suspenders: no stray file anywhere above WIKI
+assert (W / "pages" / "topics" / "victim-sources.md").exists(), "companion lands in-tree by stem"
 assert not (W.parent / "escape_canary" / "pwned-sources.md").exists(), "escaped companion must not exist"
-print("ok 2: oversized page with `../`-slug spills no companion, escapes nothing")
+print("ok 2: `../`-slug page splits by SAFE STEM in-tree, escapes nothing (I4)")
+
+# =============================================================================================
+# 2b. I4 CROSS-PAGE OVERWRITE — a crafted `slug:` naming ANOTHER page's companion must not aim the
+#     split at it. `attacker.md` carries `slug: victim` but splits to `attacker-sources.md` (its
+#     stem), never `victim-sources.md`.
+# =============================================================================================
+W, canary = fresh_wiki()
+(W / "pages" / "topics" / "victim-sources.md").write_text("---\nname: V\nslug: victim-sources\n---\nPRECIOUS ARCHIVE\n")
+atk_rel = "pages/topics/attacker.md"
+(W / atk_rel).write_text(big_page("victim"))    # slug claims the victim
+_new, comp_rel, _c = wiki._split_oversized_page(atk_rel, (W / atk_rel).read_text(), 160)
+assert comp_rel == "pages/topics/attacker-sources.md", "split must target OWN stem, not slug: %r" % (comp_rel,)
+assert "PRECIOUS ARCHIVE" in (W / "pages" / "topics" / "victim-sources.md").read_text(), \
+    "a crafted slug must never redirect the split onto another page's companion"
+print("ok 2b: crafted slug cannot aim the companion split at another page (I4)")
+
+# =============================================================================================
+# 2c. I4 COMPANION WRITE-REFUSAL — a model FILE-block for a `<slug>-sources` page is refused by
+#     _write_ingest_pages (companions are written ONLY by the split), new or overwrite.
+# =============================================================================================
+W, canary = fresh_wiki()
+(W / "pages" / "topics" / "topic-sources.md").write_text("---\nname: A\nslug: topic-sources\n---\nARCHIVE\n")
+block = ("=== FILE: pages/topics/topic-sources.md ===\n"
+         "---\nname: A\ndescription: d\ntype: topic\nslug: topic-sources\n"
+         "created: 2026-07-19\nupdated: 2026-07-19\nstatus: active\n---\n# A\n\nHIJACKED\n=== END ===\n")
+written = wiki._write_ingest_pages(block, {"pages/topics/topic-sources.md"})   # even if 'allowed'
+assert written == [], "a model-emitted companion block must be refused: %r" % written
+assert (W / "pages" / "topics" / "topic-sources.md").read_text().endswith("ARCHIVE\n"), \
+    "the existing companion must be untouched by a refused block"
+print("ok 2c: model-emitted `<slug>-sources` block refused; existing companion untouched (I4)")
 
 # =============================================================================================
 # 3. FEATURE INTACT — an oversized page with a NORMAL slug still splits into an in-WIKI companion.
