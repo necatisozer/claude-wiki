@@ -5,6 +5,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-07-19
+
+Patch release: two fixes born from live incidents — a stale-cache engine guard
+and support for Claude Code's 2026-07 transcript-format additions.
+
+### Added
+
+- **Stale-cache engine guard.** Claude Code materializes the plugin into a
+  version-keyed cache and a long-running process keeps executing the version it
+  loaded at startup — so after an upgrade, hooks could silently run an OLD
+  engine against current data (observed live: a stale 0.1.0 engine ran the
+  weekly lint with pre-0.1.2 rules and reported 92 false findings). An engine
+  executing from the plugin cache now refuses hook-driven work (`record`,
+  `maintain`) when its version differs from the installed marketplace manifest,
+  logging a "restart Claude Code" hint; nothing is lost — reconcile re-records
+  skipped sessions and due jobs run on the next current-engine session start.
+  `wiki doctor` gains a `version` row reporting engine/installed parity and any
+  stale cache dirs. Dev checkouts and the marketplace clone never trip the
+  guard.
+
+### Changed
+
+- **Transcript-format drift resolved for the 2026-07 entry types.** The cleaner
+  now recognizes seven new Claude Code JSONL entry types: `agent-name` becomes
+  a session-title fallback (`ai-title` still wins), `pr-link` surfaces in the
+  cleaned body as `PR: repo#number` — deliberately never the URL, which would
+  trip the ingest risk gate downstream — and `file-history-delta`,
+  `agent-setting`, `worktree-state`, `relocated`, `frame-link` are recognized
+  non-content metadata. The drift tally prunes types the engine has since
+  learned, so doctor stops warning after an upgrade instead of alerting forever
+  on stale counts.
+
 ## [0.1.3] - 2026-07-18
 
 Patch release: keep the schema's hard-contradiction promise, and fix four
