@@ -1702,12 +1702,19 @@ def _finalize_ingest_pages(written, cfg):
     return written + extra
 
 # ---------------------------------------------------------------- WP1 ROW 1: deterministic risk gate
-# The auto-accept HOLD decision is computed SOLELY by the engine from the PROPOSED change — NEVER from
-# a model-emitted field (the old `hard_contradiction`/SUMMARY line an injection can just set to "none").
-# HOLD when a proposed page overwrites a tracked page beyond a diff-size cap, or its body carries a
-# risky shape (imperative / second-person address, a URL, or a secret/PII pattern). Linear-time
-# patterns only (no catastrophic backtracking); scanner input is bounded upstream.
+# The auto-accept ALLOW decision is computed SOLELY by the engine from the PROPOSED change — a
+# model-emitted field can never buy a commit (an injection can just set `hard_contradiction:` to
+# "none", so the deterministic checks below never depend on it). The field IS honored in the
+# fail-closed direction only: a non-none `hard_contradiction:` line ADDS a hold (that's the
+# SCHEMA.md rule-5 promise — "held for review, not auto-committed"), and blanking it changes
+# nothing because every deterministic check still runs. HOLD when a proposed page overwrites a
+# tracked page beyond a diff-size cap, or its body carries a risky shape (imperative /
+# second-person address, a URL, or a secret/PII pattern). Linear-time patterns only (no
+# catastrophic backtracking); scanner input is bounded upstream.
 _URL_RX = re.compile(r"(?i)\b(?:https?|ftp|ftps):\/\/\S")
+# SUMMARY-line `hard_contradiction:` — matched anywhere in the result, fail-closed (a body line that
+# fakes it can only cause a spurious hold, never an allow).
+_HARD_CONTRA_RX = re.compile(r"(?im)^\s*hard_contradiction:\s*(.+?)\s*$")
 _IMPERATIVE_RX = re.compile(
     r"(?im)\byou\b|\byour\b|\byourself\b|\byou're\b"                       # second-person address
     r"|\b(?:ignore|disregard|forget)\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|earlier)\b"
@@ -1737,16 +1744,24 @@ def _tracked_page_diff_lines(relpath, new_content):
                if ln[:1] in "+-" and not ln.startswith(("+++", "---")))
 
 def _ingest_hold_reason(result, cfg):
-    """The WP1 ROW 1 auto-accept gate → a HOLD reason (str), or '' to auto-accept. DETERMINISTIC and
-    engine-computed from the model's proposed FILE blocks: it inspects ONLY block paths/bodies, NEVER
-    the model's SUMMARY / hard_contradiction line. HOLD when a block overwrites a tracked page beyond
-    the diff cap, or its body carries a risky shape.
+    """The WP1 ROW 1 auto-accept gate → a HOLD reason (str), or '' to auto-accept. The ALLOW path is
+    DETERMINISTIC and engine-computed from the model's proposed FILE blocks (block paths/bodies);
+    the model's `hard_contradiction:` SUMMARY line is trusted fail-closed ONLY — a non-none value
+    adds a hold, a blanked one buys nothing. HOLD when a block overwrites a tracked page beyond
+    the diff cap, its body carries a risky shape, or the model reports a hard contradiction.
     WP4 ROW 2 — `ingest.mode`: `auto` (default) = the deterministic risk gate below; `review` =
     ALWAYS stage for human review (never auto-commit), wired here as an unconditional hold."""
     if cfg.get("ingest", {}).get("mode", "auto") == "review":
         return "review mode: staging every batch for human review (ingest.mode=review)"
     cap = int(cfg.get("ingest", {}).get("max_overwrite_lines", 60))
     reasons = []
+    # ANY non-none occurrence holds (finditer, not search): a decoy "hard_contradiction: none" line
+    # planted in a page body must not mask a real SUMMARY line. Content-free reason on purpose (the
+    # string lands in state/log): the substance is already in the staged pages' ⚠️ CONTRADICTION
+    # notes, which is what the reviewer reads anyway.
+    if any(m.group(1).strip().strip("<>").lower() not in ("none", "")
+           for m in _HARD_CONTRA_RX.finditer(result or "")):
+        reasons.append("model-reported hard contradiction (fail-closed hold — see staged ⚠️ notes)")
     for relpath, content in parse_file_blocks(result):
         n = _tracked_page_diff_lines(relpath, content)
         if n > cap:

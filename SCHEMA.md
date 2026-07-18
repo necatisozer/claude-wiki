@@ -4,7 +4,7 @@ This file is the rulebook for maintaining the wiki. Every LLM ingest/lint step r
 
 ## Layers (what lives where)
 - **Raw sources** (immutable): the Claude Code `.jsonl` transcripts under `~/.claude/projects/**`. Referenced, never copied.
-- **Journal** (`journal/**/*.md`): one transient per-session summary each. **Fuel, not nodes.** After a journal entry is ingested it serves as provenance only; a retention pass may archive old ingested entries later (not yet automated). **Never index journal entries.**
+- **Journal** (`journal/**/*.md`): one transient per-session summary each. **Fuel, not nodes.** After a journal entry is ingested it serves as provenance only; `maintain` automatically archives ingested entries older than `journal.archive_after_days` under `journal/archive/` (never deleted). **Never index journal entries.**
 - **The durable wiki = `pages/topics/` + `pages/projects/` ONLY.** These are the cross-referenced nodes.
 - **`index.md`**: a catalog of topic + project pages (regenerated mechanically — do NOT hand-edit; never lists sessions).
 
