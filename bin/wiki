@@ -787,9 +787,41 @@ def _record_drift(unknown_types):
         _atomic_write(_drift_state_path(), json.dumps({"types": seen, "updated": now_iso()}, indent=2))
     return new
 
+# ---------------------------------------------------------------- stale-cache engine guard (v0.1.4)
+# Claude Code materializes the plugin into a VERSION-KEYED cache (~/.claude/plugins/cache/<mp>/
+# <plugin>/<version>/), and a long-running process keeps executing the version it loaded at startup —
+# so after an upgrade, hooks can silently run an OLD engine against current data until the app
+# restarts (live incident 2026-07-19: a stale 0.1.0 cache engine swept the corpus with pre-0.1.2 lint
+# rules → 92 false findings). Guard: an engine executing FROM the cache refuses hook-driven work when
+# its version differs from the installed marketplace manifest. Scoped to cache paths only — dev
+# checkouts, the marketplace clone, and test copies are legitimate run locations and never trip it.
+def _manifest_version(root):
+    with contextlib.suppress(Exception):
+        return json.loads((Path(root) / ".claude-plugin" / "plugin.json").read_text()).get("version")
+    return None
+
+def _stale_cache_engine():
+    """('mine', 'installed') when THIS engine runs from the version-keyed plugin cache and its version
+    differs from the installed marketplace manifest; None otherwise. No marketplace clone visible →
+    None (can't judge; also keeps tests with an overridden HOME out of the guard's blast radius)."""
+    if "/plugins/cache/" not in str(CODE_ROOT).replace("\\", "/"):
+        return None
+    inst = _manifest_version(HOME / ".claude" / "plugins" / "marketplaces" / "claude-wiki")
+    if inst is None:
+        return None
+    mine = _manifest_version(CODE_ROOT)
+    if mine != inst:
+        return (mine or "unknown", inst)
+    return None
+
 def cmd_record(args):
     cfg = load_config()
     if not cfg.get("enabled", True):
+        return 0
+    stale = _stale_cache_engine()
+    if stale:   # refuse to write journals with outdated redaction/classifier rules; reconcile (from a
+        log("record: REFUSED — stale cache engine %s != installed %s (restart Claude Code); "
+            "reconcile catches this session up" % stale)   # current engine) re-records from the transcript
         return 0
     if not schema_guard():   # WP4 ROW 4 — refuse to write records into newer-than-engine data
         return 0
@@ -2349,6 +2381,11 @@ def cmd_maintain(args):
     lock so they never race. Reconcile runs FIRST so caught-up sessions are folded in the same pass."""
     cfg = load_config()
     if not cfg.get("enabled", True):
+        return 0
+    stale = _stale_cache_engine()
+    if stale:   # never run scheduled jobs (ingest folds! lint reports!) with an outdated engine — the
+        log("maintain: REFUSED — stale cache engine %s != installed %s (restart Claude Code); "
+            "jobs stay due and run on the next current-engine session start" % stale)
         return 0
     import fcntl
     (WIKI / "state").mkdir(parents=True, exist_ok=True)
@@ -4045,6 +4082,23 @@ def cmd_doctor(args):
              critical=True)
     else:
         line("schema", True, "v%s (engine v%d)" % (d if d is not None else "—", ENGINE_SCHEMA))
+    # v0.1.4 — version parity: THIS engine vs the installed marketplace manifest, plus any OTHER
+    # version-keyed cache dirs a not-yet-restarted Claude Code process could still be executing.
+    # Advisory: presence of old cache dirs is normal; the guard (record/maintain) blocks actual use.
+    mine, inst = _manifest_version(CODE_ROOT), \
+        _manifest_version(HOME / ".claude" / "plugins" / "marketplaces" / "claude-wiki")
+    stale = _stale_cache_engine()
+    others = []
+    with contextlib.suppress(Exception):
+        cache = HOME / ".claude" / "plugins" / "cache" / "claude-wiki" / "wiki"
+        others = sorted(p.name for p in cache.iterdir() if p.is_dir() and p.name != (inst or ""))
+    if stale:
+        line("version", False, "RUNNING engine %s != installed %s — restart Claude Code" % stale)
+    else:
+        detail = "engine %s / installed %s" % (mine or "—", inst or "—")
+        if others:
+            detail += " · stale cache dir(s): %s (inert unless an old process still runs them)" % ", ".join(others)
+        line("version", True, detail)
     scfg = _sync_cfg()
     if scfg.get("enabled"):
         line("sync", True, "armed → origin/%s" % scfg.get("branch", "main"))
