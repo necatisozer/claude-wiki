@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-07-18
+
+Patch release: keep the schema's hard-contradiction promise, and fix four
+documentation inaccuracies surfaced by a two-agent audit of the shipped tree
+against its original design (Karpathy's LLM-wiki gist).
+
+### Changed
+
+- **`hard_contradiction:` is now honored fail-closed.** SCHEMA.md rule 5 has
+  always promised that a model-reported hard contradiction is "held for review,
+  not auto-committed" — but the engine ignored the field entirely, so a hard
+  contradiction that stayed under the diff cap with clean shapes auto-committed.
+  The gate now treats any non-`none` `hard_contradiction:` line as an
+  *additional* hold reason. Trust is strictly one-directional: the field can add
+  a hold, never clear one — an injection that blanks it changes nothing, because
+  every deterministic check still runs — and a decoy `none` line planted in a
+  page body cannot mask a real one. The hold reason stays content-free.
+
+### Fixed
+
+- ARCHITECTURE.md's divergences list now documents two real departures it was
+  missing: the schema is a fixed shipped contract (not per-user co-designed, a
+  data-repo SCHEMA.md is ignored), and "sessions subsume notes" has a known
+  edge (exploratory sessions collapse to one-line records).
+- ARCHITECTURE.md's sync-boundary parity claim no longer overstates: pulled
+  content passes the symlink/secret/size/UTF-8 gates; instruction-shaped text
+  is neutralized by the digest sandbox rather than rejecting the pull.
+- SCHEMA.md no longer calls journal retention "not yet automated" — `maintain`
+  has archived ingested entries on a 90-day default since 0.1.0.
+
 ## [0.1.2] - 2026-07-18
 
 Patch release: decouple the lint detection-net sensitivity from the security gate.
