@@ -89,7 +89,7 @@ h, c, s = wiki.clean_transcript(FIXTURES / "clean.jsonl")
 assert h["sessionId"] == CLEAN_SID
 assert h["cwd"] == CLEAN_CWD
 assert h["branch"] == "main"
-assert h["title"] == "Add rate limiting to API gateway"          # harvested from the ai-title entry
+assert h["title"] == "Add rate limiting to API gateway"          # ai-title wins over the earlier agent-name
 assert h["models"] == {"claude-sonnet-4-6"}
 assert h["tool_counts"] == {"Read": 1, "Edit": 1, "Write": 1, "Bash": 2}
 assert h["files_touched"] == {"/Users/necatisozer/dev/apigw/gateway.py",
@@ -99,7 +99,9 @@ assert s["user_prompts"] == 1, s          # 3 user-side noise lines dropped, not
 assert s["assistant_texts"] == 6, s
 assert s["edits"] == 2 and s["commits"] == 1, s
 assert s["messages"] == 15, s
-assert s["unknown_types"] == {"telemetry"}, s   # unknown type tracked but emits nothing
+assert s["unknown_types"] == {"telemetry"}, s   # unknown type tracked but emits nothing — and the
+# 2026-07 format additions (agent-name/pr-link/file-history-delta/agent-setting/worktree-state/
+# relocated/frame-link, all in the fixture) are KNOWN: none of them may appear here
 
 # substantive content kept
 assert "token-bucket rate limiting" in c        # user prompt survived
@@ -108,6 +110,9 @@ assert "• Edit: /Users/necatisozer/dev/apigw/gateway.py" in c
 assert "• Write: /Users/necatisozer/dev/apigw/limiter.py" in c
 assert "• Bash: git commit -am 'add token-bucket rate limiter'" in c
 assert "12 passed in 1.24s" in c                # tool result head kept
+assert "PR: nsz/apigw#7" in c                   # pr-link surfaces as repo#number…
+assert "github.com" not in c                    # …but the URL itself is NEVER emitted (risk-gate shape)
+assert "AGENTNAME" not in c                     # agent-name payload never lands in the body
 # noise dropped
 assert "THINK_MARKER" not in c                  # thinking block dropped
 assert "<command-name" not in c                 # slash-command echo dropped

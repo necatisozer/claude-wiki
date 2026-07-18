@@ -56,7 +56,14 @@ DROP_TYPES = {
     "attachment", "system", "mode", "permission-mode", "last-prompt",
     "file-history-snapshot", "queue-operation", "bridge-session", "summary",
     "tool_reference", "direct", "ai-title", "tools_changed", "plan_mode",
+    # 2026-07 transcript-format additions (all non-content metadata; shapes verified against live
+    # transcripts): per-file backup deltas, agent config, worktree/session bookkeeping, UI frame links.
+    "file-history-delta", "agent-setting", "worktree-state", "relocated", "frame-link",
 }
+# Entry types the cleaner HANDLES specially (harvested, not dropped, not drift): keep in sync with
+# clean_transcript's per-type branches. _read_drift uses this to prune a stale tally once a
+# previously-unknown type becomes known — otherwise doctor would warn forever off old counts.
+HANDLED_TYPES = {"ai-title", "agent-name", "pr-link"}
 
 # WP5 (S4) — single source of truth for the per-stage model. Floating family aliases ("haiku"/
 # "sonnet") so the model tracks the `claude` CLI's current pin rather than a stale date-stamped id;
@@ -448,6 +455,19 @@ def clean_transcript(path):
             if t == "ai-title":
                 header["title"] = obj.get("aiTitle") or header["title"]
                 continue
+            if t == "agent-name":
+                # background/agent sessions get their name here; an aiTitle, when present, wins
+                # (the ai-title branch above overrides a title this set).
+                header["title"] = header["title"] or obj.get("agentName")
+                continue
+            if t == "pr-link":
+                # session↔PR association — recordable signal. Emit repo#number ONLY, never prUrl:
+                # a URL here would ride record → journal → ingest into a page and trip the risk
+                # gate's URL hold on otherwise-clean content.
+                repo, num = obj.get("prRepository"), obj.get("prNumber")
+                if repo and num:
+                    add("PR: %s#%s" % (truncate(str(repo), 80), truncate(str(num), 12)))
+                continue
             if t in DROP_TYPES:
                 continue
 
@@ -740,13 +760,16 @@ def _drift_state_path():
     return WIKI / "state" / "drift.json"
 
 def _read_drift():
-    """The persisted unknown-transcript-type tally {type: count}, or {} when none seen."""
+    """The persisted unknown-transcript-type tally {type: count}, or {} when none seen. Types the
+    cleaner has since learned (DROP_TYPES / HANDLED_TYPES) are pruned on read, so an engine upgrade
+    that teaches a type retires its stale tally instead of warning forever."""
     p = _drift_state_path()
     if p.exists():
         with contextlib.suppress(Exception):
             data = json.loads(p.read_text())
             if isinstance(data, dict) and isinstance(data.get("types"), dict):
-                return data["types"]
+                return {t: c for t, c in data["types"].items()
+                        if t not in DROP_TYPES and t not in HANDLED_TYPES}
     return {}
 
 def _record_drift(unknown_types):
