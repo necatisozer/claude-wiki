@@ -1788,16 +1788,47 @@ _IMPERATIVE_RX = re.compile(
     r"|\b(?:please\s+)?(?:run|execute|send|fetch|download|curl|wget|email|post|export|exfiltrate|"
     r"reveal|share|paste|click|visit|browse|delete|remove)\b\s")
 
+# v0.1.6 — TIERED ingest-hold shapes (component detectors, used ONLY by _risky_shapes below; the
+# record-stage classifier still uses the broad _IMPERATIVE_RX above). Rationale: on a corpus of
+# security-review notes, a lone imperative verb ("remove before GA", "delete dead links") or a lone
+# reference URL fires on the MAJORITY of folds (measured 57% of pages), so a hold-on-any-single
+# trains the reviewer to rubber-stamp — a 100%-firing gate is a broken signal. The genuinely
+# injection-shaped patterns (override clause; imperative+URL exfil; imperative aimed with 2nd-person;
+# curl/wget/exfiltrate) fire on ~0% of legit prose (measured: 1 page). So a single incidental shape
+# no longer holds; only an injection-shaped COMBINATION (or a hard-credential shape) does.
+_OVERRIDE_RX = re.compile(
+    r"(?im)\b(?:ignore|disregard|forget)\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|earlier)\b")
+_SECOND_PERSON_RX = re.compile(r"(?im)\byou\b|\byour\b|\byourself\b|\byou're\b")
+# every imperative verb is COMBO-ONLY (incl. fetch/download — this app is a media DOWNLOADER, so
+# those are domain vocabulary, not attack signal: measured in 18 files)…
+_IMP_VERB_RX = re.compile(
+    r"(?im)\b(?:please\s+)?(?:run|execute|send|fetch|download|email|post|export|reveal|"
+    r"share|paste|click|visit|browse|delete|remove)\b\s")
+# …except these three, which never appear in legitimate notes (measured: 1 file in 351) — they hold
+# even alone, at ~zero friction, preserving coverage of the most explicit attack shapes.
+_PURE_ATTACK_RX = re.compile(r"(?im)\b(?:curl|wget|exfiltrate)\b")
+
 def _risky_shapes(text):
-    """Deterministic risky-shape tags for ingest OUTPUT (WP1 ROW 1): second-person/imperative address,
-    URLs, or secret/PII patterns (scan_secrets). Empty list = clean. Never returns raw matched text."""
+    """Deterministic risky-shape tags for ingest OUTPUT (WP1 ROW 1) — TIERED (v0.1.6): a HARD shape
+    (secret/PII, an instruction-override clause, or a pure-attack token) holds ALONE; every other
+    imperative/URL/2nd-person shape holds ONLY in an injection-shaped combination (imperative+URL, or
+    imperative aimed with 2nd-person address). Empty list = clean. Never returns raw matched text.
+    The record-stage reject gate (classify_record → _IMPERATIVE_RX) is UNCHANGED and still broad."""
+    t = text or ""
     tags = []
-    if scan_secrets(text):
+    if scan_secrets(t):                       # credential/PII — strictest, never narrowed
         tags.append("secret/PII")
-    if _URL_RX.search(text or ""):
-        tags.append("url")
-    if _IMPERATIVE_RX.search(text or ""):
-        tags.append("imperative/2nd-person")
+    if _OVERRIDE_RX.search(t):                # "ignore/disregard previous …" — canonical injection
+        tags.append("instruction-override")
+    if _PURE_ATTACK_RX.search(t):            # curl/wget/exfiltrate — never legit prose here
+        tags.append("attack-verb")
+    has_url = bool(_URL_RX.search(t))
+    has_imp = bool(_IMP_VERB_RX.search(t))
+    has_2nd = bool(_SECOND_PERSON_RX.search(t))
+    if has_imp and has_url:                   # "fetch … https://…" — the exfil shape
+        tags.append("imperative+url")
+    if has_imp and has_2nd:                   # "send your …" / "reveal your …" — directive aimed at reader
+        tags.append("imperative+2nd-person")
     return tags
 
 def _tracked_page_diff_lines(relpath, new_content):
