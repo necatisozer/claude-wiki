@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-07-19
+
+Tuning release: retarget the ingest risk gate from "hold on any single shape" to
+"hold on injection-shaped combinations", so the gate stays a meaningful signal on
+a corpus whose ordinary vocabulary overlaps the threat vocabulary.
+
+### Changed
+
+- **Ingest risk gate is now tiered.** The auto-accept hold previously fired on ANY
+  single risky shape — one URL, one imperative verb, or a bare "you". On a corpus
+  of security-review notes those saturate (measured: 57% of pages held), so the
+  gate fired on nearly every batch and trained the reviewer to rubber-stamp — a
+  signal that is always on carries no information. The gate now holds only on:
+  a **hard** shape that stands alone (secret/PII, an instruction-override clause
+  like "ignore previous …", or `curl`/`wget`/`exfiltrate`), or an
+  **injection-shaped combination** (imperative + URL, or imperative + second-person
+  address). A lone reference URL, a lone imperative verb (`delete`, `remove`, and —
+  because this engine's own domain is media downloading — `fetch`/`download`), or a
+  bare "you"/"your" in prose no longer holds. On the current corpus this drops
+  held pages from 12/21 to 1/21, and the one that still holds is a genuine
+  imperative+URL combination.
+- **The secret/PII hold is unchanged and unconditional** — narrowing applies only
+  to the instruction-shape tier, never to credential detection.
+- **The record-stage reject classifier is unchanged.** It still uses the broad
+  shape pattern (a fail-closed *reject*, not a *hold*), by design — reject→keep is
+  a different risk decision than hold→review and is out of scope for this release.
+
 ## [0.1.5] - 2026-07-19
 
 Security & integrity release: fixes for the findings of a 15-agent audit of the
