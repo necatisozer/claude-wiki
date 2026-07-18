@@ -110,8 +110,9 @@ the engine**; **stage-then-promote every write**. Concretely:
 - **Deterministic risk-gated auto-accept.** `ingest.mode: auto` (default) folds under an
   engine-computed hold: a batch that overwrites a tracked page, exceeds the diff cap, or carries a
   risky shape (imperative / 2nd-person / URL / secret / PII) is HELD (staged, uncommitted) for review.
-  `ingest.mode: review` always stages. The engine never parses a model-emitted `hard_contradiction`
-  field as a gate.
+  `ingest.mode: review` always stages. A model-emitted `hard_contradiction:` line is honored only
+  **fail-closed**: a non-`none` value adds a hold, but the field can never clear one — the engine
+  never trusts model output to *allow* a commit, so an injection that blanks the field changes nothing.
 - **Secret gate.** A redactor masks credential/secret shapes (AWS keys, GitHub/Slack tokens, private
   keys, JWTs, connection strings, Stripe/Google keys, high-entropy assignments, …) **before** the LLM
   sees the transcript **and** at write time; a **per-commit** scan (including commit messages)
@@ -120,8 +121,10 @@ the engine**; **stage-then-promote every write**. Concretely:
 - **Transport allowlist.** `wiki init <target>` accepts only an `owner/repo` slug, an `https://`/`ssh`
   URL, or a local path; it rejects leading-`-` option-injection and `::` transport-helper forms.
   Process-wide `GIT_ALLOW_PROTOCOL=https:ssh:file` belts every git/gh child.
-- **Sync-boundary parity.** Pulled pages/journal pass the same symlink/instruction/secret/size/UTF-8
-  gates as local writes; the engine does not trust an inbound `ingested:` flag from the remote.
+- **Sync-boundary parity.** Pulled pages/journal pass the same symlink/secret/size/UTF-8 gates as
+  local writes; the engine does not trust an inbound `ingested:` flag from the remote.
+  Instruction-shaped text is deliberately **not** a pull reject (a lone URL in a legitimately synced
+  page must not wedge all future sync) — it is neutralized at read time by the digest sandbox instead.
 - **Schema-version migration guard.** `config.json` carries a durable `schema_version`. On a mutating
   command the engine compares it to its own `ENGINE_SCHEMA`: older → run the idempotent migration
   chain; **newer → refuse** (an older engine must never corrupt data a newer one wrote).
@@ -203,7 +206,14 @@ These are deliberate departures the release consciously made:
 - **Budgets and the `ollama:<model>` backend descoped.** No `*_max_usd` budget knobs; cost is governed
   instead by `ingest.max_sessions_per_run`, `ingest.auto_max_batches`, and the `record.*` input caps.
 - **Sessions subsume notes.** No `query --save` / `wiki note` — recorded sessions are the memory
-  substrate, so a separate note-compounding surface was unnecessary.
+  substrate, so a separate note-compounding surface was unnecessary. Known edge: the record step
+  collapses an exploratory session with no durable outcome to a one-line summary, so a purely
+  analytical Q&A session compounds only weakly — the trade accepted for keeping record cheap.
+- **The schema is fixed, not co-designed.** The original design invites each user to co-evolve their
+  own schema document with their agent. A distributed plugin needs a stable editorial contract — the
+  engine's gates and tests assume it — so one `SCHEMA.md` ships in `CODE_ROOT` for every install and
+  a copy inside a memory repo is ignored. Users customize operational config (crons, caps,
+  `ingest.mode`, exclusions), never the taxonomy or editorial rules.
 - **The map is not injected.** The digest carries bounded recents + orientation only; the full
   topic/project link graph is read on demand from `index.md` (Karpathy's routing-file model) rather
   than pushed into every session.
