@@ -117,6 +117,10 @@ When `lint-report.md` has findings (surfaced in the digest + `wiki status`), the
 3. **Fixes only what the user directs** — verifying each flagged claim against its source journal (by
    `sessionId`) first, then committing per fix.
 
+A **stale-page** finding (`slug(Nd)`) is report-only: the engine never edits the page. Clear it by
+re-verifying the page's claims and bumping `updated:`, letting a fold touch it naturally, or setting
+a non-`active` status (`archived`) if the page is deliberately dormant.
+
 Never build or enable an autonomous `wiki lint --fix` path without explicit approval.
 
 ## Resolving a held ingest (hard contradiction)

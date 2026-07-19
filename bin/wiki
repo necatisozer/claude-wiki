@@ -2154,12 +2154,37 @@ def _lint_shape_tags(text):
         tags.append("leak")
     return tags
 
+def _page_freshness_age(fm, text, today):
+    """v0.1.9 — days since the page's newest evidence of freshness: the max of frontmatter
+    `created:`/`updated:` and every dated `- YYYY-MM-DD` Sources bullet. Dates in the future beyond
+    one day of clock/timezone skew are IGNORED — a poisoned fold cannot immortalize a page with
+    `updated: 2099-01-01`. Returns None when the page carries no parseable date at all."""
+    cand = [str(fm.get("created") or "").strip(), str(fm.get("updated") or "").strip()]
+    for ln in text.split("\n"):
+        m = _SRC_DATE_RX.match(ln)
+        if m:
+            cand.append(m.group(1))
+    best = None
+    for s in cand:
+        try:
+            d = datetime.strptime(s, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if (d - today).days > 1:
+            continue
+        if best is None or d > best:
+            best = d
+    return None if best is None else (today - best).days
+
 def lint_deterministic():
     """Free structural checks over ALL pages (+ the WP4 detection net over pages AND journal entries).
     Returns (findings dict, pages dict, report markdown)."""
     lc = load_config().get("lint", {}) if isinstance(load_config().get("lint"), dict) else {}
     maxlines = lc.get("max_page_lines", 160)
     desc_cap = int(lc.get("desc_max_chars", 120))
+    stale_days = {"projects": int(lc.get("stale_projects_days", 60)),
+                  "topics": int(lc.get("stale_topics_days", 0))}      # v0.1.9 — 0 = off per kind
+    today = datetime.now(timezone.utc).date()                          # same clock as now_iso()
     pages = {}
     for kind in ("projects", "topics"):
         for p in sorted(glob.glob(str(WIKI / "pages" / kind / "*.md"))):
@@ -2171,7 +2196,8 @@ def lint_deterministic():
     inbound = {s: set() for s in slugs}
     f = {"dangling": [], "orphans": [], "bad_fm": [], "unsourced": [], "bloat": [], "contradicted": [],
          "dup_title": [], "desc_long": [], "poison": [],   # WP4 ROW 5 (desc_long) + ROW 3 (poison net)
-         "bad_cite": [], "homonym": []}                    # v0.1.8 — citation resolution + identity net
+         "bad_cite": [], "homonym": [],                    # v0.1.8 — citation resolution + identity net
+         "stale": []}                                      # v0.1.9 — report-only page staleness
     known_sids = _known_sid8s()                            # v0.1.8 — one filename glob for the whole sweep
     for slug, pg in pages.items():
         for tgt in set(re.findall(r'\[\[([a-z0-9-]+)\]\]', pg["text"])):
@@ -2223,6 +2249,23 @@ def lint_deterministic():
             f["dup_title"].append("%s≈%s" % (slug, seen_titles[title]))
         elif title:
             seen_titles[title] = slug
+        # v0.1.9 — REPORT-ONLY staleness: flag an ACTIVE page whose newest freshness evidence is
+        # older than its kind's threshold. Never writes anything (no status flip, no engine-owned
+        # key — the decided design): the un-flag paths are human-owned — a fold touching the page,
+        # bumping `updated:` after re-verifying, or setting a non-active status (archived/stale are
+        # deliberate states and exempt, as are `-sources` companions — old by construction).
+        # Advisory: a malformed page skips silently, never wedges the sweep.
+        try:
+            days = stale_days.get(pg["kind"], 0)
+            if (days and not Path(pg["path"]).stem.endswith("-sources")
+                    and (fm.get("status") or "active") == "active"):
+                age = _page_freshness_age(fm, pg["text"], today)
+                if age is None:
+                    f["stale"].append("%s(no dated sources)" % slug)
+                elif age > days:
+                    f["stale"].append("%s(%dd)" % (slug, age))
+        except Exception:
+            pass
     # v0.1.8 — near-homonym net over EXISTING page identities (file stems): the fold-time guard only
     # sees new pages, so a collision that predates the guard (or arrived via sync) surfaces here.
     seen_norms = {}
@@ -2252,6 +2295,7 @@ def lint_deterministic():
                        ("Poison shapes (leak/injection/secret — detection net)", "poison"),
                        ("Unresolvable/malformed citations (no matching journal entry)", "bad_cite"),
                        ("Near-homonym page identities (likely same concept)", "homonym"),
+                       ("Stale pages (no fresh source/update in the window — re-verify or archive)", "stale"),
                        ("Unresolved contradictions", "contradicted"),
                        ("Duplicate titles", "dup_title")):
         rep.append("- **%s:** %s" % (label, ", ".join(f[key]) if f[key] else "none"))
@@ -2261,9 +2305,10 @@ def _lint_open_count(f):
     # dangling links are informational per SCHEMA → not counted as "open". The WP4 net findings
     # (desc_long, poison) ARE high-severity open findings and feed the lint_open banner — as are the
     # v0.1.8 provenance/identity findings (bad_cite, homonym): a broken citation is a provenance
-    # break, not a write-later stub.
+    # break, not a write-later stub. `stale` (v0.1.9) counts too: it is actionable (re-verify →
+    # bump updated:, or archive) and exists to be seen, not to decorate the report.
     return sum(len(f[k]) for k in ("orphans", "bad_fm", "unsourced", "bloat", "contradicted",
-                                   "dup_title", "desc_long", "poison", "bad_cite", "homonym"))
+                                   "dup_title", "desc_long", "poison", "bad_cite", "homonym", "stale"))
 
 _HIGH_SEV_RX = re.compile(r"(?im)\[\s*high\s*\]")
 
@@ -3118,7 +3163,14 @@ DEFAULT_CONFIG = {
                "stall_threshold": 20},   # WP4 ROW 3 — un-ingested backlog past this → stall banner
     #   ingest.mode: "auto" (S2-gated auto-commit) | "review" (always stage batches for human review)
     "lint":   {"model": MODEL_DEFAULTS["lint"], "cron": "0 20 * * 1", "enabled": True,
-               "max_page_lines": 160, "desc_max_chars": 120},   # WP4 ROW 5 — desc-length lint cap
+               "max_page_lines": 160, "desc_max_chars": 120,   # WP4 ROW 5 — desc-length lint cap
+               # v0.1.9 — report-only staleness: flag an ACTIVE page whose newest evidence of
+               # freshness (created/updated/newest Sources date) is older than N days. Projects
+               # default 60d ("confident-but-stale is the dominant failure past ~day 60" — the
+               # thread's best-attested production report); topics default OFF — topic pages hold
+               # durable external facts that don't decay on a timer. 0 = off. Named distinctly from
+               # doctor.stale_after_days (days since last RECORD — a different clock entirely).
+               "stale_projects_days": 60, "stale_topics_days": 0},
     # WP4 ROW 2 — doctor: stale-capture window (days since last record → "possibly stale" note) and a
     # per-probe timeout so a hung external tool can't wedge doctor. 0 stale_after_days disables the note.
     "doctor": {"stale_after_days": 7, "probe_timeout_seconds": 20},

@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] - 2026-07-20
+
+### Added
+
+- **Report-only page staleness.** The full-thread audit's best-attested production
+  report was "confident-but-stale memory is the dominant failure past ~day 60" —
+  and the engine never looked at page age. Lint now flags an `active` page whose
+  newest evidence of freshness (frontmatter `created:`/`updated:` or the newest
+  dated `## Sources` bullet) is older than a per-kind window:
+  `lint.stale_projects_days` (default 60) and `lint.stale_topics_days` (default
+  0 = off — topic pages hold durable external facts that don't decay on a
+  timer). Strictly report-only by decision: the engine never flips a status,
+  writes a key, or touches the page — `status:` stays fully human/model-owned
+  (the red-team found `status: stale` already carries user semantics on a real
+  corpus). Clear a flag by re-verifying and bumping `updated:`, letting a fold
+  touch the page, or setting a non-`active` status. Future-dated frontmatter
+  beyond one day of clock skew is ignored, so a poisoned fold cannot immortalize
+  a page with `updated: 2099-01-01`; `-sources` companions are exempt (old by
+  construction); a malformed page skips silently rather than wedging the sweep.
+  Findings feed the `lint_open` banner. Live-corpus check before release: zero
+  flags (project ages 1–23 days), open count unchanged.
+
 ## [0.1.8] - 2026-07-19
 
 Gap-fill release: the ship-ready designs from the full-thread audit of Karpathy's
