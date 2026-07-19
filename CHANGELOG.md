@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-07-19
+
+Tuning release (companion to 0.1.6): retarget the record-stage reject classifier
+the same way — the only gate that silently drops a session now drops far less.
+
+### Changed
+
+- **Record-stage injection reject is now override-clause-only.** The record
+  classifier is the one gate that *silently drops* a session (fail-closed, never
+  journaled). It previously rejected on the broad shape check (bare "you", any
+  imperative verb, a URL), which dropped ~11% of sessions in production and would
+  reject 20% of the already-kept corpus on replay — legitimate security-review
+  work, unrecoverable. It now rejects for injection only on an unambiguous
+  instruction-override clause ("ignore/disregard/forget … previous"), which has
+  zero false positives on the real corpus. Replay: sessions dropped for injection
+  falls from 68/330 to 0; 62 previously-lost sessions would be kept.
+- **Ambiguous shapes are held, not dropped.** Imperative+URL, imperative+
+  second-person, and `curl`/`wget`/`exfiltrate` are no longer a silent drop at
+  record — they survive to the journal and are caught reviewably by the ingest
+  risk gate's HOLD (a hold can be accepted; a drop cannot be undone). The one
+  "hard" match the corpus produced was itself a false positive (a session that
+  "verified fix via curl"), confirming those tokens are unsafe as a drop trigger.
+- **Secret/PII and leak-shape (chain-of-thought / system-prompt / tool-transcript
+  leakage) rejects are unchanged** — narrowing applies only to the injection tier.
+
+The pipeline's three tiers are now coherent: silent-drop → override clause only;
+reviewable-hold → attack tokens + injection combinations (0.1.6); keep → lone
+imperatives / URLs / second-person prose.
+
 ## [0.1.6] - 2026-07-19
 
 Tuning release: retarget the ingest risk gate from "hold on any single shape" to
