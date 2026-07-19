@@ -1,7 +1,7 @@
 {
   "name": "wiki",
   "description": "Local session-wiki: records Claude Code sessions into a queryable markdown memory with on-demand keyword search and a SessionStart digest.",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "license": "MIT",
   "homepage": "https://github.com/necatisozer/claude-wiki",
   "repository": "https://github.com/necatisozer/claude-wiki",

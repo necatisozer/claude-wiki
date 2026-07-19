@@ -179,6 +179,8 @@ unknown keys, wrong types, and out-of-range values are **advisory** (listed, non
 | `lint.enabled` | `true` | Enable scheduled lint. |
 | `lint.max_page_lines` | `160` | Page-length lint cap. |
 | `lint.desc_max_chars` | `120` | Description-length lint cap. |
+| `lint.stale_projects_days` | `60` | Report-only staleness window for **project** pages: an `active` page whose newest freshness evidence (`created:`/`updated:`/newest Sources date) is older flags in lint. `0` = off. Distinct from `doctor.stale_after_days` (days since last *record*). |
+| `lint.stale_topics_days` | `0` | Same for **topic** pages — off by default (durable external facts don't decay on a timer). |
 | `doctor.stale_after_days` | `7` | Days since last record → "possibly stale" note (0 = off). |
 | `doctor.probe_timeout_seconds` | `20` | Per-probe timeout so a hung tool can't wedge doctor. |
 | `journal.archive_after_days` | `90` | Archive ingested journal entries older than this (0 = off). |
