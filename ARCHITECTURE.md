@@ -83,6 +83,14 @@ surfaces:
 3. **Claude's built-in `Read`** — open any page under the memory repo directly. Read is read-only, so
    it prompts on no path by default; the digest points, query finds, Read opens.
 
+Since 0.1.10 the record step also **captures each session's recall usage** (Phase A of index
+convergence): `wiki query` calls — hit/miss classified from the paired tool result — and Reads of
+wiki files land as an engine-computed `recall:` key in the journal entry's frontmatter, terms
+ASCII-folded and whitelist-sanitized. Counts surface in `wiki status`; the terms themselves are
+never displayed or injected (they are attacker-seedable via a poisoned transcript, so they wait
+inert until a future, deliberately-designed Phase B folds recurring demand into `index.md` — not
+built yet: measured organic volume is ~1 recall session/month, below any honest threshold).
+
 Awareness lives in the digest; depth lives in the on-demand primitives. The plugin ships scoped
 allow-rules (`Bash(...wiki query|status|doctor:*)` + `Read(~/.claude/wiki/**)`) so these read surfaces
 run prompt-free — see the README's permission-setup note (plugin-shipped permissions are not yet

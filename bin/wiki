@@ -36,7 +36,7 @@ no-op when WIKI_ENGINE is set, so the engine never self-records or self-injects.
 trust boundaries, and the config reference: see ARCHITECTURE.md (in the plugin repo).
 """
 
-import sys, os, json, re, sqlite3, subprocess, glob, contextlib, difflib
+import sys, os, json, re, sqlite3, subprocess, glob, contextlib, difflib, shlex, unicodedata
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -409,11 +409,86 @@ def result_head(res, tur, is_err):
     suffix = " ERROR" if is_err else ""
     return truncate(first, 160) + suffix
 
+# ---------------------------------------------------------------- v0.1.10: recall capture (Phase A)
+# The convergence gap: nothing records what a session had to HUNT for, so index.md and the digest
+# orientation can never learn from recall misses. Phase A captures the raw signal DETERMINISTICALLY
+# from the transcript's actual tool_use records — a `wiki … query` Bash call (hit/miss classified
+# from its paired tool_result) and Reads/Greps of wiki files — into ONE engine-computed journal
+# frontmatter key (`recall:`). The record LLM never touches it and no model-emitted field feeds it.
+# Phase B (folding recurring demand into index descriptions) is deliberately NOT built yet: measured
+# organic volume is ~1 recall session/month, so any threshold would first surface engine-dev noise.
+# Consumption surfaces are COUNT-ONLY (the terms are attacker-seedable via a poisoned transcript and
+# are never displayed or injected — they wait, sanitized and inert, in journal frontmatter).
+_RECALL_CAP = 8              # events per session — signal, not a keylog
+
+def _sanitize_recall_term(s):
+    """ASCII-fold (NFKD — Turkish 'sözleşme' → 'sozlesme', not mangled), lowercase, whitelist
+    [a-z0-9 -], collapse hyphen runs (a '---' can never even resemble a frontmatter delimiter),
+    collapse whitespace, cap 60 chars. The whitelist makes a captured term structurally unable to
+    carry a secret, a URL, or an instruction shape into frontmatter."""
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii").lower()
+    s = re.sub(r"[^a-z0-9 -]+", " ", s)
+    s = re.sub(r"-{2,}", "-", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:60]
+
+def _recall_query_term(cmd):
+    """The sanitized search term of a `wiki … query …` Bash command, or None when the command isn't
+    a wiki query. Flag tokens (`--json`, `--limit 5`) are dropped; the digest's own literal
+    `<terms>` placeholder is ignored (it's the suggestion text, not a search)."""
+    cmd = str(cmd or "")
+    if "query" not in cmd or "wiki" not in cmd or "<terms>" in cmd:
+        return None
+    try:
+        toks = shlex.split(cmd)
+    except Exception:
+        return None
+    for i, t in enumerate(toks):
+        if t == "query" and i > 0 and os.path.basename(toks[i - 1]).lower() == "wiki":
+            words = [w for w in toks[i + 1:] if not w.startswith("-")]
+            return _sanitize_recall_term(" ".join(words)) or None
+    return None
+
+def _recall_wiki_rel(p):
+    """WIKI-relative path of a Read/Grep/Glob target when it is a memory file (index.md / pages/ /
+    journal/), else None. Engine-computed from the path prefix; anything odd is simply not captured."""
+    p = str(p or "")
+    if not p.startswith(str(WIKI) + os.sep):
+        return None
+    rel = os.path.relpath(p, str(WIKI)).replace(os.sep, "/")
+    if ".." in rel or any(ord(c) < 32 for c in rel):
+        return None
+    if not (rel == "index.md" or rel.startswith("pages/") or rel.startswith("journal/")):
+        return None
+    return rel[:80]
+
+def _recall_result_hit(res, tur, is_err):
+    """Classify a wiki-query tool_result: False = confirmed miss (`no matches for` — the exact
+    string cmd_query prints — or `--json`'s bare `[]`), True = confirmed hit, None = unknown
+    (errored / interrupted / empty). Only confirmed values are ever counted downstream."""
+    if is_err:
+        return None
+    text = ""
+    if isinstance(res, str):
+        text = res
+    elif isinstance(res, list):
+        text = " ".join(x.get("text", "") for x in res if isinstance(x, dict))
+    if not text and isinstance(tur, dict):
+        text = tur.get("stdout") or tur.get("stderr") or ""
+    elif not text and isinstance(tur, str):
+        text = tur
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.startswith("no matches for") or text == "[]":
+        return False
+    return True
+
 def clean_transcript(path):
     """Return (header dict, cleaned_text, stats dict)."""
     header = {"sessionId": None, "cwd": None, "branch": None, "title": None,
               "started": None, "ended": None, "models": set(),
-              "tool_counts": {}, "files_touched": set(), "subagents": 0}
+              "tool_counts": {}, "files_touched": set(), "subagents": 0, "recall": []}
     out = []
     _acc = [0]       # running char total → bound accumulation (a session of millions of msgs can't OOM)
     def add(line):
@@ -421,6 +496,7 @@ def clean_transcript(path):
             out.append(line)
             _acc[0] += len(line) + 1
     pending = {}     # tool_use_id -> (name, input)
+    recall_q = {}    # tool_use_id -> the pending recall event awaiting its hit/miss result (v0.1.10)
     stats = {"user_prompts": 0, "assistant_texts": 0, "edits": 0, "commits": 0,
              "messages": 0, "unknown_types": set()}
 
@@ -428,6 +504,9 @@ def clean_transcript(path):
         name, inp = pending.pop(tuid, (None, None))
         if name is None:
             return
+        ev = recall_q.pop(tuid, None)
+        if ev is not None:                                   # v0.1.10 — pair the query with its result
+            ev["hit"] = _recall_result_hit(res, tur, is_err)
         ka = keyarg(name, inp)
         ka = truncate(ka, 120)
         add("  • %s: %s → \"%s\"" % (name, ka, result_head(res, tur, is_err)))
@@ -527,6 +606,18 @@ def clean_transcript(path):
                             if fp: header["files_touched"].add(fp)
                         elif nm == "Bash" and "git commit" in str(inp.get("command", "")):
                             stats["commits"] += 1
+                        # v0.1.10 — recall capture (Phase A): engine-computed, capped, sanitized.
+                        if len(header["recall"]) < _RECALL_CAP:
+                            if nm == "Bash":
+                                term = _recall_query_term(inp.get("command"))
+                                if term is not None:
+                                    ev = {"q": term, "hit": None}
+                                    header["recall"].append(ev)
+                                    recall_q[it.get("id")] = ev
+                            elif nm in ("Read", "Grep", "Glob"):
+                                rel = _recall_wiki_rel(inp.get("file_path") or inp.get("path"))
+                                if rel and not any(e.get("read") == rel for e in header["recall"]):
+                                    header["recall"].append({"read": rel})
                         pending[it.get("id")] = (nm, inp)
 
     # fold subagents (final report only)
@@ -738,6 +829,13 @@ def write_journal(header, body, source_path, desc=None, rel=None, ingested_flag=
         "tools: " + (tools or "none"),
         "files_touched: " + str(len(header["files_touched"])),
         "subagents: " + str(header.get("subagents", 0)),
+    ]
+    # v0.1.10 — recall capture (Phase A): engine-computed compact JSON, one line (json.dumps escapes
+    # every newline, and the terms are whitelist-sanitized upstream — nothing here can resemble a
+    # frontmatter delimiter or carry a secret/instruction shape). Omitted entirely when empty.
+    if header.get("recall"):
+        fm.append("recall: " + json.dumps(header["recall"], separators=(",", ":")))
+    fm += [
         "ingested: " + ("true" if ingested_flag else "false"),
         "source: " + str(source_path),
         "---",
@@ -1223,6 +1321,31 @@ def read_stdin_json():
     except Exception:
         return {}
 
+def _recall_counts(jfiles):
+    """v0.1.10 — aggregate the Phase-A recall capture across the hot journal: (queries, confirmed
+    misses, wiki reads). COUNTS ONLY by design — the captured terms are attacker-seedable via a
+    poisoned transcript and are never displayed, injected, or interpolated anywhere."""
+    nq = nmiss = nread = 0
+    for p in jfiles:
+        if _under_journal_archive(p):
+            continue
+        try:
+            raw = parse_frontmatter(_read_capped(p, errors="replace")).get("recall")
+            if not raw:
+                continue
+            for ev in json.loads(raw):
+                if not isinstance(ev, dict):
+                    continue
+                if "q" in ev:
+                    nq += 1
+                    if ev.get("hit") is False:
+                        nmiss += 1
+                elif "read" in ev:
+                    nread += 1
+        except Exception:
+            continue
+    return nq, nmiss, nread
+
 def cmd_status(args):
     # WP4 ROW 7 — status polish: aligned label:value block, grouped action-first SIGNALS
     # (stall / lint / stale / held / push / pull — count + action only, never session content).
@@ -1256,6 +1379,12 @@ def cmd_status(args):
     kv("last lint", "%s · %s" % (read_last_lint() or "—",
                                  ("%d open finding(s)" % n_lint) if n_lint else "clean"))
     kv("last ingest", read_last_ingest() or "—")
+    # v0.1.10 — recall capture (Phase A): count-only, shown only once real signal exists.
+    nq, nmiss, nread = _recall_counts(jfiles)
+    if nq or nread:
+        kv("recall events", "%d wiki quer%s (%d confirmed miss%s) · %d wiki read(s) — captured for "
+           "future index convergence" % (nq, "y" if nq == 1 else "ies",
+                                         nmiss, "" if nmiss == 1 else "es", nread))
     # --- SIGNALS (grouped; each is count + action, no content) ---
     signals = []
     pend = _pending_ingest_count()   # WP4 ROW 3 — stalled-ingest backlog

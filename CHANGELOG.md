@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.10] - 2026-07-20
+
+### Added
+
+- **Recall capture (Phase A of index convergence).** Nothing recorded what a
+  session had to *hunt* for, so `index.md` and the digest orientation could
+  never learn from recall misses. The record step now captures each session's
+  memory lookups deterministically from the transcript's actual tool calls —
+  `wiki … query` Bash invocations (hit/miss classified from the paired tool
+  result: `no matches for` or `--json`'s `[]` = confirmed miss; errored or
+  unpaired = unknown) and Reads/Greps of wiki files — into one engine-computed
+  `recall:` key in the journal entry's frontmatter. Never a model field. Terms
+  are ASCII-folded (Turkish sözleşme → sozlesme, not mangled), whitelist-
+  sanitized to `[a-z0-9 -]` with hyphen runs collapsed — structurally unable to
+  carry a secret, URL, instruction shape, or frontmatter delimiter — capped at
+  8 events/session; the digest's own literal `<terms>` suggestion is ignored.
+  `wiki status` gains a **count-only** line (queries / confirmed misses / wiki
+  reads): the captured terms are attacker-seedable via a poisoned transcript
+  and are never displayed, injected, or interpolated anywhere.
+- **Phase B is deliberately not built.** Folding recurring demand into
+  `index.md` descriptions waits for real data: measured organic volume is ~1
+  recall session/month, below any honest recurrence threshold — a Phase B
+  shipped today would first surface engine-dev vocabulary. The signal now
+  accumulates inert until there is something true to converge on.
+
 ## [0.1.9] - 2026-07-20
 
 ### Added

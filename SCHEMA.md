@@ -60,6 +60,7 @@ model: <models seen, comma-joined>
 tools: <Tool×N, …  or "none">
 files_touched: <int>
 subagents: <int>
+recall: [{"q":"<term>","hit":false}, {"read":"pages/…"}]   # OPTIONAL, engine-computed: the session's wiki-recall events
 ingested: false                # flips to true at ingest-commit time — the DURABLE, git-synced fold marker
 source: <path to the raw .jsonl transcript>   # provenance; the transcript itself is never copied
 ---
@@ -69,6 +70,7 @@ source: <path to the raw .jsonl transcript>   # provenance; the transcript itsel
 ```
 - **`ingested`** is the source of truth for "already folded": `reindex` rebuilds ledger state from it, so history is never re-folded through the LLM. `ingest --accept` and re-records preserve it in place (keeping the filename stable so `## Sources` citations don't dangle).
 - **`sessionId`** is the join key. Page `## Sources` bullets cite the first 8 chars (`sid8`); to verify a claim, open the journal entry whose `sessionId` starts with that `sid8`.
+- **`recall`** (optional) records the session's memory lookups — `wiki query` calls with a confirmed hit/miss, and Reads of wiki files — computed deterministically by the engine from the transcript's tool calls (never a model field; terms are ASCII-folded and whitelist-sanitized). It is raw signal for future index convergence; nothing displays or injects the terms.
 - Bodies are secret-redacted at write time (a raw credential never lands here). Old ingested entries are archived (never deleted) under `journal/archive/YYYY/MM` after `journal.archive_after_days`.
 
 ## Rules for ingest/lint
