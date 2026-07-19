@@ -664,7 +664,14 @@ def classify_record(header, cleaned, body, desc, cfg):
     # ---- P0 (S5 amendment) — secret/PII, then prompt-injection shapes → FAIL-CLOSED ----
     if scan_secrets(blob):                       # reuse the credential/PII detector (survived redaction)
         return "reject", "secret/PII-shape", desc
-    if _IMPERATIVE_RX.search(blob):              # reuse the existing shape helper (2nd-person/imperative/"ignore previous")
+    # v0.1.7 — record-REJECT is the only gate that SILENTLY DROPS a session, so it rejects on injection
+    # ONLY when the summary carries an unambiguous instruction-override clause ("ignore/disregard/forget
+    # … previous"): 0 occurrences in the real corpus → 0 false drops, while the old broad shape check
+    # (bare "you" / any imperative verb / a URL) rejected ~11% of sessions in production and 22% of the
+    # KEPT corpus on replay — legitimate security-review work, lost. Ambiguous shapes (imperative+URL,
+    # imperative+2nd-person, curl/wget) are NOT dropped here: they survive to the journal and are caught,
+    # REVIEWABLY, by the ingest risk gate's HOLD (a hold can be accepted; a drop cannot be undone).
+    if _OVERRIDE_RX.search(blob):
         return "reject", "injection-shape", desc
     # ---- P1 — chain-of-thought / system-prompt / tool-transcript leakage → FAIL-CLOSED ----
     if _LEAK_RX.search(blob):
@@ -1782,14 +1789,8 @@ _URL_RX = re.compile(r"(?i)\b(?:https?|ftp|ftps):\/\/\S")
 # SUMMARY-line `hard_contradiction:` — matched anywhere in the result, fail-closed (a body line that
 # fakes it can only cause a spurious hold, never an allow).
 _HARD_CONTRA_RX = re.compile(r"(?im)^\s*hard_contradiction:\s*(.+?)\s*$")
-_IMPERATIVE_RX = re.compile(
-    r"(?im)\byou\b|\byour\b|\byourself\b|\byou're\b"                       # second-person address
-    r"|\b(?:ignore|disregard|forget)\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|earlier)\b"
-    r"|\b(?:please\s+)?(?:run|execute|send|fetch|download|curl|wget|email|post|export|exfiltrate|"
-    r"reveal|share|paste|click|visit|browse|delete|remove)\b\s")
-
 # v0.1.6 — TIERED ingest-hold shapes (component detectors, used ONLY by _risky_shapes below; the
-# record-stage classifier still uses the broad _IMPERATIVE_RX above). Rationale: on a corpus of
+# record-stage reject uses _OVERRIDE_RX only; see classify_record). Rationale: on a corpus of
 # security-review notes, a lone imperative verb ("remove before GA", "delete dead links") or a lone
 # reference URL fires on the MAJORITY of folds (measured 57% of pages), so a hold-on-any-single
 # trains the reviewer to rubber-stamp — a 100%-firing gate is a broken signal. The genuinely
@@ -1813,7 +1814,7 @@ def _risky_shapes(text):
     (secret/PII, an instruction-override clause, or a pure-attack token) holds ALONE; every other
     imperative/URL/2nd-person shape holds ONLY in an injection-shaped combination (imperative+URL, or
     imperative aimed with 2nd-person address). Empty list = clean. Never returns raw matched text.
-    The record-stage reject gate (classify_record → _IMPERATIVE_RX) is UNCHANGED and still broad."""
+    The record-stage reject gate (classify_record → _OVERRIDE_RX) is override-clause-only (v0.1.7)."""
     t = text or ""
     tags = []
     if scan_secrets(t):                       # credential/PII — strictest, never narrowed
