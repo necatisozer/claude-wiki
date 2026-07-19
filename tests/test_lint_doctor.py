@@ -203,6 +203,9 @@ W2 = git_wiki("lintdoc_high_w_")
     "---\nname: Demo\ndescription: A demo project page.\ntype: project\nslug: demo\n"
     "created: 2026-07-01\nupdated: 2026-07-06\nstatus: active\n---\n"
     "# Demo\n## What this is\nA small demo codebase.\n## Sources\n- 2026-07-06 · ddd44444 · notes\n")
+# v0.1.8: 'structurally clean' now includes citation resolution — seed the journal entry the page cites.
+(W2 / "journal" / "2026" / "07" / "2026-07-06__notes__ddd44444.md").write_text(
+    "---\nname: Notes\nsessionId: ddd44444-0000-4000-8000-000000000000\ningested: true\n---\n# Notes\n\nn\n")
 review = W2 / "state"; review.mkdir(parents=True, exist_ok=True)
 review_body = review / "review.md"
 review_body.write_text("## Semantic review\n- [high] a claim on demo is unsourced\n"

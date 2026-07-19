@@ -1290,10 +1290,15 @@ def cmd_status(args):
 #  so _read_capped / _bounded_lines see them before first use. WP5 hoist.)
 
 # ---------------------------------------------------------------- phase 2: ingest → topic/project pages
+# v0.1.8 — the frontmatter delimiter is LINE-ANCHORED (a line that is exactly `---`), not the substring
+# "---": a value containing a dash run (e.g. a description quoting "a --- b") must not truncate the
+# machine-read block and silently drop the keys after it (ingested:/sessionId:/source: are load-bearing).
+_FM_DELIM_RX = re.compile(r"(?m)^---[ \t]*$")
+
 def parse_frontmatter(text):
     fm = {}
     if text.startswith("---"):
-        blk = text.split("---", 2)
+        blk = _FM_DELIM_RX.split(text, 2)
         if len(blk) >= 3:
             for line in blk[1].splitlines():
                 if ":" in line:
@@ -1665,6 +1670,38 @@ def _write_ingest_pages(result, allowlist):
 # to bloat — per the S2 decision "sort Sources chronologically at ingest; split before the 160-line cap".
 _SRC_DATE_RX = re.compile(r'^\s*-\s*(\d{4}-\d{2}-\d{2})\b')
 
+# ---------------------------------------------------------------- v0.1.8: deterministic citation resolution
+# SCHEMA rule 3 says "a claim with no traceable source doesn't belong" — but nothing verified it: the
+# fold model could confabulate a `- YYYY-MM-DD · <sid8> · …` bullet whose sid8 matches no journal entry
+# and it landed silently. Resolution is engine-computed from JOURNAL FILENAMES ONLY (live + archive —
+# retention archives precisely so citations stay valid; the SQLite ledger is deliberately excluded:
+# it's device-local unsynced state, and a ledger-only sid8 still has no journal entry to open, which per
+# SCHEMA's join rule IS a dangling citation). Model output can never make a sid8 resolve — it can only
+# introduce one, which HOLDs (fail-closed, adds-only).
+_JOURNAL_SID8_RX = re.compile(r"__([0-9a-fA-F]{8})\.md$")
+_CITE_SID8_RX = re.compile(r"(?m)^\s*-\s*\d{4}-\d{2}-\d{2}\s*[·•]\s*([0-9a-fA-F]{8})\b")
+_SRC_PTR_RX = re.compile(r"^\s*-\s*…earlier sources archived → \[\[[a-z0-9-]+\]\]\s*$")
+
+def _known_sid8s():
+    """Every sid8 the journal can resolve, from filenames only (zero file reads): the trailing
+    `__<8-hex>.md` token of each entry under journal/ INCLUDING the retention archive."""
+    out = set()
+    for p in glob.glob(str(WIKI / "journal" / "**" / "*.md"), recursive=True):
+        m = _JOURNAL_SID8_RX.search(os.path.basename(p))
+        if m:
+            out.add(m.group(1).lower())
+    return out
+
+def _page_sid8s(text):
+    """All sid8s cited by citation-shaped lines anywhere in `text` (whole-text scan on purpose:
+    a decoy citation planted OUTSIDE ## Sources can only ADD a hold, never clear one)."""
+    return {m.group(1).lower() for m in _CITE_SID8_RX.finditer(text or "")}
+
+def _head_page_text(relpath):
+    """HEAD's committed version of a page, or '' when untracked (genuinely-new page / non-git tree)."""
+    r = git("show", "HEAD:" + relpath)
+    return r.stdout if r.returncode == 0 else ""
+
 def _sources_block_span(lines):
     """(start, end) of the contiguous `- ` bullet run under the LAST `## Sources` heading, or None."""
     idx = max((i for i, ln in enumerate(lines) if ln.strip().lower() == "## sources"), default=None)
@@ -1753,23 +1790,76 @@ def _split_oversized_page(relpath, text, maxlines):
     ] + moved + [""])
     return "\n".join(lines), "pages/%s/%s.md" % (kind, comp_slug), comp
 
+def _cap_frontmatter_desc(text, cap):
+    """v0.1.8 — deterministic write-time repair: truncate an over-cap frontmatter `description:` at
+    fold-write (the same transform record applies to session descriptions), so desc_long stops
+    recurring as a lint finding the user must clean up by hand. Rewrites ONLY the first
+    `description:` line inside the leading frontmatter block; JSON-quotes the repaired value so the
+    round-trip through parse_frontmatter is exact. Returns text unchanged when within cap."""
+    d = str(parse_frontmatter(text).get("description") or "")
+    if len(d) <= cap:
+        return text
+    short = truncate(d, cap - 2)
+    lines = text.split("\n")
+    in_fm = False
+    for i, ln in enumerate(lines):
+        if _FM_DELIM_RX.match(ln):
+            if in_fm:
+                break                                     # closing delimiter — no description line found
+            in_fm = True
+            continue
+        if in_fm and ln.startswith("description:"):
+            lines[i] = "description: " + json.dumps(short)
+            return "\n".join(lines)
+    return text
+
+def _merge_companion(existing, fresh):
+    """v0.1.8 — a re-split of the same page must APPEND its newly-moved citations to the existing
+    `<slug>-sources` companion, never overwrite it (the overwrite deleted every previously-archived
+    citation — observed live). Keeps the existing companion's frontmatter/body, unions the Sources
+    bullets (exact-duplicate lines dropped), and re-sorts chronologically. Defensive: on any
+    unexpected shape, returns `existing` unchanged (never lose the archive)."""
+    fr_lines = fresh.split("\n")
+    fspan = _sources_block_span(fr_lines)
+    if not fspan:
+        return existing
+    add = fr_lines[fspan[0]:fspan[1]]
+    ex_lines = existing.split("\n")
+    espan = _sources_block_span(ex_lines)
+    if espan:
+        start, end = espan
+        seen = set(ex_lines[start:end])
+        ex_lines[end:end] = [b for b in add if b not in seen]
+    else:
+        while ex_lines and ex_lines[-1].strip() == "":
+            ex_lines.pop()
+        ex_lines += ["", "## Sources"] + add + [""]
+    return _sort_page_sources("\n".join(ex_lines))
+
 def _finalize_ingest_pages(written, cfg):
-    """WP4 ROW 6 — post-write pass over the just-written pages: order each page's `## Sources`
-    chronologically, then split any page over the line cap into a linked companion. Returns the
-    (possibly extended) written list. Never raises — a per-page failure leaves that page untouched."""
+    """WP4 ROW 6 — post-write pass over the just-written pages: cap the frontmatter description
+    (v0.1.8), order each page's `## Sources` chronologically, then split any page over the line cap
+    into a linked companion (APPENDING to an existing companion, never clobbering it — v0.1.8).
+    Returns the (possibly extended) written list. Never raises — a per-page failure leaves that
+    page untouched."""
     lc = cfg.get("lint") if isinstance(cfg.get("lint"), dict) else {}
     maxlines = int(lc.get("max_page_lines", 160))
+    desc_cap = int(lc.get("desc_max_chars", 120))
     extra = []
     for rel in list(written):
         try:
             fp = WIKI / rel
             text = fp.read_text(errors="surrogateescape")
-            new = _sort_page_sources(text)
+            new = _cap_frontmatter_desc(text, desc_cap)
+            new = _sort_page_sources(new)
             new, comp_rel, comp = _split_oversized_page(rel, new, maxlines)
             if new != text:
                 _atomic_write(fp, new)
             if comp_rel and comp:
-                _atomic_write(WIKI / comp_rel, comp)
+                cf = WIKI / comp_rel
+                if cf.exists():
+                    comp = _merge_companion(cf.read_text(errors="surrogateescape"), comp)
+                _atomic_write(cf, comp)
                 extra.append(comp_rel)
         except Exception as e:
             log("ingest finalize: skipped", rel, repr(e))
@@ -1842,6 +1932,57 @@ def _tracked_page_diff_lines(relpath, new_content):
                                                 n=0, lineterm="")
                if ln[:1] in "+-" and not ln.startswith(("+++", "---")))
 
+# ---------------------------------------------------------------- v0.1.8: homonym guard (fold-time)
+# Page identity IS the filename stem — two distinct concepts whose names slugify identically (or
+# near-identically: `metro-di` vs `metrodi`, singular/plural) would silently become one page. The
+# guard fires ONLY for blocks whose target does NOT exist on disk (genuinely-new pages): folding
+# INTO an existing page is the normal case and is structurally exempt, so it can never false-positive
+# on a legitimate same-topic fold. Wrong-identity merges into an EXISTING page are unreachable by
+# construction here; what this catches is a new page landing beside a near-identical identity.
+def _ident_norm(stem):
+    """Aggressive identity normalization for homonym detection ONLY (never for paths/links):
+    lowercase, drop hyphens, strip one trailing 's' (metro-di≈metrodi, convention≈conventions)."""
+    s = str(stem).lower().replace("-", "")
+    return s[:-1] if len(s) > 3 and s.endswith("s") else s
+
+def _homonym_hold_reasons(blocks):
+    """HOLD reasons for new-page identity collisions, seeded from the on-disk namespace and folded
+    forward across the batch (block N is checked against blocks 1..N-1 too — two colliding NEW pages
+    in one fold must not slip through). Never raises: an internal error CONVERTS to a hold reason
+    (fail-closed, not a crash loop; never silently fail-open)."""
+    try:
+        ns = {}                                            # stem → kind, from disk
+        norms = {}                                         # _ident_norm(stem) → stem
+        for kind in ("projects", "topics"):
+            for p in glob.glob(str(WIKI / "pages" / kind / "*.md")):
+                stem = Path(p).stem
+                ns[stem] = kind
+                norms.setdefault(_ident_norm(stem), stem)
+        reasons = []
+        for relpath, _content in blocks:
+            base = os.path.basename(relpath)
+            if (".." in relpath or not base.endswith(".md")
+                    or not (relpath.startswith("pages/topics/") or relpath.startswith("pages/projects/"))):
+                continue                                   # unsafe paths are refused by the write guard
+            stem = base[:-3]
+            if stem.endswith("-sources"):
+                continue                                   # companion blocks are refused outright elsewhere
+            kind = "projects" if relpath.startswith("pages/projects/") else "topics"
+            if (WIKI / relpath).exists():
+                continue                                   # fold into an existing page — the normal case
+            if stem in ns and ns[stem] != kind:            # cross-kind exact-stem clash
+                reasons.append("new page %s collides with existing pages/%s/%s.md (same identity, "
+                               "different kind)" % (relpath, ns[stem], stem))
+            other = norms.get(_ident_norm(stem))
+            if other is not None and other != stem:        # near-identical identity (norm collision)
+                reasons.append("new page %s is a near-homonym of existing page '%s' — likely the "
+                               "same concept under a variant name" % (relpath, other))
+            ns.setdefault(stem, kind)                      # fold THIS block into the namespace so a
+            norms.setdefault(_ident_norm(stem), stem)      # later block in the same batch is checked too
+        return reasons
+    except Exception as e:
+        return ["homonym guard error: %s (fail-closed hold)" % type(e).__name__]
+
 def _ingest_hold_reason(result, cfg):
     """The WP1 ROW 1 auto-accept gate → a HOLD reason (str), or '' to auto-accept. The ALLOW path is
     DETERMINISTIC and engine-computed from the model's proposed FILE blocks (block paths/bodies);
@@ -1861,13 +2002,24 @@ def _ingest_hold_reason(result, cfg):
     if any(m.group(1).strip().strip("<>").lower() not in ("none", "")
            for m in _HARD_CONTRA_RX.finditer(result or "")):
         reasons.append("model-reported hard contradiction (fail-closed hold — see staged ⚠️ notes)")
-    for relpath, content in parse_file_blocks(result):
+    blocks = parse_file_blocks(result)
+    known = _known_sid8s()          # v0.1.8 — engine-computed resolution set; model output can't extend it
+    for relpath, content in blocks:
         n = _tracked_page_diff_lines(relpath, content)
         if n > cap:
             reasons.append("large rewrite of tracked page %s (%d changed lines > %d)" % (relpath, n, cap))
         tags = _risky_shapes(content)
         if tags:
             reasons.append("risky shapes in %s: %s" % (relpath, ", ".join(tags)))
+        # v0.1.8 — citation resolution, DELTA-gated: hold only on sid8s this fold NEWLY introduces
+        # (an already-committed dangle is a lint finding, not a permanent hold-loop — SCHEMA rule 3
+        # makes the model preserve existing Sources, so a non-delta gate could never converge).
+        # Reason text embeds only regex-constrained 8-hex tokens + the block relpath.
+        intro = (_page_sid8s(content) - known) - _page_sid8s(_head_page_text(relpath))
+        if intro:
+            reasons.append("unresolvable citation(s) in %s: %s (no matching journal entry)"
+                           % (relpath, ", ".join(sorted(intro))))
+    reasons.extend(_homonym_hold_reasons(blocks))          # v0.1.8 — new-page identity collisions
     return "; ".join(reasons)
 
 def _ingest_auto_batch(cfg, conn):
@@ -1905,8 +2057,14 @@ def _ingest_auto_batch(cfg, conn):
     regenerate_index()
     slugs = ", ".join(sorted({os.path.splitext(os.path.basename(w))[0] for w in written}))
     for _, pp in rows:
-        _flip_journal_ingested(pp)      # durable flag, committed with this batch (journal is in scope below)
-    r = git_commit_paths("ingest (auto): %d sessions → %s" % (len(rows), slugs), "pages", "index.md", "journal")
+        _flip_journal_ingested(pp)      # durable flag, committed with this batch (exact path below)
+    # v0.1.8 — commit EXACT paths, not the bare `pages`/`journal` pathspecs: this runs unattended, and
+    # a broad pathspec would sweep the user's concurrent hand-edits to unrelated pages into an
+    # engine-authored commit. (The interactive --accept flow keeps the broad spec on purpose — there
+    # the user just reviewed the whole diff, hand-fixes included.)
+    batch_paths = [p for p in written + ["index.md"] + [pp for _, pp in rows if pp]
+                   if (WIKI / p).exists()]
+    r = git_commit_paths("ingest (auto): %d sessions → %s" % (len(rows), slugs), *batch_paths)
     if r.returncode != 0:
         # v0.1.5 (integrity-audit I5): NEVER advance the ledger past a failed commit — written pages
         # would sit uncommitted (invisible to digest/HEAD) while the ledger claims them folded. Leave
@@ -2012,7 +2170,9 @@ def lint_deterministic():
     slugs = set(pages)
     inbound = {s: set() for s in slugs}
     f = {"dangling": [], "orphans": [], "bad_fm": [], "unsourced": [], "bloat": [], "contradicted": [],
-         "dup_title": [], "desc_long": [], "poison": []}   # WP4 ROW 5 (desc_long) + ROW 3 (poison net)
+         "dup_title": [], "desc_long": [], "poison": [],   # WP4 ROW 5 (desc_long) + ROW 3 (poison net)
+         "bad_cite": [], "homonym": []}                    # v0.1.8 — citation resolution + identity net
+    known_sids = _known_sid8s()                            # v0.1.8 — one filename glob for the whole sweep
     for slug, pg in pages.items():
         for tgt in set(re.findall(r'\[\[([a-z0-9-]+)\]\]', pg["text"])):
             if tgt == slug:
@@ -2044,11 +2204,37 @@ def lint_deterministic():
         tags = _lint_shape_tags(pg["text"])
         if tags:
             f["poison"].append("%s(%s)" % (pg["path"], ",".join(tags)))
+        # v0.1.8 — citation resolution over LANDED pages: (a) every cited sid8 must resolve to a
+        # journal entry; (b) every `- ` bullet under ## Sources must be citation-shaped or the
+        # engine's archive pointer — a homoglyph separator / 9-hex token / malformed date would
+        # otherwise present citation-LOOKING provenance the strict resolver never checks.
+        unres = _page_sid8s(pg["text"]) - known_sids
+        if unres:
+            f["bad_cite"].append("%s(%s)" % (slug, ",".join(sorted(unres))))
+        plines = pg["text"].split("\n")
+        pspan = _sources_block_span(plines)
+        if pspan:
+            n_mal = sum(1 for ln in plines[pspan[0]:pspan[1]]
+                        if not (_CITE_SID8_RX.match(ln) or _SRC_PTR_RX.match(ln)))
+            if n_mal:
+                f["bad_cite"].append("%s(malformed×%d)" % (slug, n_mal))
         title = (fm.get("name") or "").strip().lower()
         if title and title in seen_titles:
             f["dup_title"].append("%s≈%s" % (slug, seen_titles[title]))
         elif title:
             seen_titles[title] = slug
+    # v0.1.8 — near-homonym net over EXISTING page identities (file stems): the fold-time guard only
+    # sees new pages, so a collision that predates the guard (or arrived via sync) surfaces here.
+    seen_norms = {}
+    for slug, pg in sorted(pages.items()):
+        stem = Path(pg["path"]).stem
+        if stem.endswith("-sources"):
+            continue
+        k = _ident_norm(stem)
+        if k in seen_norms and seen_norms[k] != stem:
+            f["homonym"].append("%s≈%s" % (stem, seen_norms[k]))
+        else:
+            seen_norms.setdefault(k, stem)
     # WP4 ROW 3 — detection net over JOURNAL entries too (poison that landed before the classifier;
     # skip the retention archive — out of the hot path). Content-free: only path + failure class.
     for jp in sorted(glob.glob(str(WIKI / "journal" / "**" / "*.md"), recursive=True)):
@@ -2064,6 +2250,8 @@ def lint_deterministic():
                        ("Bloat (> %d lines)" % maxlines, "bloat"),
                        ("Over-long descriptions (> %d chars)" % desc_cap, "desc_long"),
                        ("Poison shapes (leak/injection/secret — detection net)", "poison"),
+                       ("Unresolvable/malformed citations (no matching journal entry)", "bad_cite"),
+                       ("Near-homonym page identities (likely same concept)", "homonym"),
                        ("Unresolved contradictions", "contradicted"),
                        ("Duplicate titles", "dup_title")):
         rep.append("- **%s:** %s" % (label, ", ".join(f[key]) if f[key] else "none"))
@@ -2071,9 +2259,11 @@ def lint_deterministic():
 
 def _lint_open_count(f):
     # dangling links are informational per SCHEMA → not counted as "open". The WP4 net findings
-    # (desc_long, poison) ARE high-severity open findings and feed the lint_open banner.
+    # (desc_long, poison) ARE high-severity open findings and feed the lint_open banner — as are the
+    # v0.1.8 provenance/identity findings (bad_cite, homonym): a broken citation is a provenance
+    # break, not a write-later stub.
     return sum(len(f[k]) for k in ("orphans", "bad_fm", "unsourced", "bloat", "contradicted",
-                                   "dup_title", "desc_long", "poison"))
+                                   "dup_title", "desc_long", "poison", "bad_cite", "homonym"))
 
 _HIGH_SEV_RX = re.compile(r"(?im)\[\s*high\s*\]")
 
@@ -2091,6 +2281,16 @@ def run_lint(cfg):
                            for pg in pages.values())   # untrusted page bodies → can't forge PAGE framing
     user_input = ("=== SCHEMA.md ===\n%s\n\n=== DETERMINISTIC FINDINGS ===\n%s\n\n=== ALL WIKI PAGES ===\n%s"
                   % ((CODE_ROOT / "SCHEMA.md").read_text(), det_report, allpages))
+    # v0.1.8 — scaling early-warning: the semantic review ships the WHOLE corpus in one LLM call, which
+    # stops working when the corpus outgrows a context window. Warn (report + log) from 80% of the
+    # budget so batched lint gets designed BEFORE the sweep starts failing, not after.
+    est_tokens = len(user_input) // 4
+    budget = int(cfg.get("lint", {}).get("single_call_token_budget", 100000))
+    size_note = ""
+    if budget and est_tokens > budget * 0.8:
+        size_note = ("\n_⚠ corpus at ~%dk of the %dk single-call lint token budget — time to design "
+                     "batched lint (see ARCHITECTURE: scaling)._\n" % (est_tokens // 1000, budget // 1000))
+        log("lint: corpus at %d of %d single-call budget tokens" % (est_tokens, budget))
     model = cfg.get("lint", {}).get("model", MODEL_DEFAULTS["lint"])
     cost = None
     try:
@@ -2100,8 +2300,8 @@ def run_lint(cfg):
         log("lint LLM ERROR", repr(e))
         llm_report = "_(LLM semantic review failed: %s — deterministic findings only.)_" % e
     report = ("# Wiki lint report — %s\n\n_Full-wiki sweep. Review-only; no pages were auto-edited. "
-              "Act on items, then re-run `wiki lint`._\n\n%s\n\n### Semantic review (LLM)\n%s\n"
-              % (now_iso()[:10], det_report, llm_report))
+              "Act on items, then re-run `wiki lint`._\n%s\n%s\n\n### Semantic review (LLM)\n%s\n"
+              % (now_iso()[:10], size_note, det_report, llm_report))
     _atomic_write(WIKI / "lint-report.md", report)
     # WP4 ROW 1 — lint_open = deterministic open findings (structural + desc/poison net) PLUS the LLM
     # review's [high]-severity findings. Re-running lint REFRESHES this count (or clears it at zero).
@@ -2534,6 +2734,16 @@ def cmd_ingest(args):
     print("wrote %d pages:" % len(written))
     for w in written:
         print("  +", w)
+    # v0.1.8 — same citation-resolution check the auto gate runs, surfaced as a review advisory here
+    # (the manual path always stages for human review, so this informs the --accept decision).
+    known = _known_sid8s()
+    for w in written:
+        try:
+            unres = sorted(_page_sid8s((WIKI / w).read_text(errors="surrogateescape")) - known)
+        except Exception:
+            unres = []
+        if unres:
+            print("  ⚠ unresolvable citation(s) in %s: %s (no matching journal entry)" % (w, ", ".join(unres)))
     if "=== SUMMARY ===" in result:
         print("\n" + result.split("=== SUMMARY ===", 1)[1].strip()[:400])
     print("\ncost=$%s · %d sessions staged · %d index entries · %d files changed"

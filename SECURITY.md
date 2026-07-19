@@ -13,8 +13,10 @@ window before publishing details.
 
 `claude-wiki` treats **all** transcript, journal, page, and pulled text as untrusted data at every LLM
 boundary, and it never lets a model-emitted field be a security gate — gates are computed
-deterministically in the engine. Writes are stage-then-promote (atomic, no symlink follow; symlink and
-gitlink blobs are rejected on write and on pull). A secret gate redacts credential shapes before any
+deterministically in the engine (including citation resolution: a fold citing a `sid8` with no
+matching journal entry, or creating a page whose identity near-collides with an existing one, is held
+for review — model output can add a hold, never clear one). Writes are stage-then-promote (atomic, no
+symlink follow; symlink and gitlink blobs are rejected on write and on pull). A secret gate redacts credential shapes before any
 LLM sees the text and before anything is written, and a per-commit scan fail-closes a push that would
 leak a secret to the remote. Recalled memory is injected only as a defanged, inert digest sandbox, and
 all engine LLM calls run with tools disabled, so a poisoned transcript cannot make the engine act. A

@@ -5,6 +5,76 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-07-19
+
+Gap-fill release: the ship-ready designs from the full-thread audit of Karpathy's
+LLM-wiki gist (983 comments swept, ideas verified against the code, each design
+adversarially red-teamed before implementation). Two new deterministic fail-closed
+gates, two write-time fixes that replace a rejected self-healing-lint framework,
+record-stage exploration preservation, and two pre-existing hardenings the
+red-team pass surfaced.
+
+### Security
+
+- **Citations now resolve or hold.** SCHEMA rule 3 ("a claim with no traceable
+  source doesn't belong") is enforced, not just promised: a fold that NEWLY
+  introduces a `- YYYY-MM-DD · <sid8> · …` citation matching no journal filename
+  is held for review (delta-gated against HEAD, so a pre-existing dangle is a
+  lint finding — never a permanent hold-loop). Resolution is computed from
+  journal filenames only (live + archive; the device-local ledger is excluded on
+  purpose) — model output can never make a sid8 resolve, only introduce one,
+  which holds. Lint gains `bad_cite`: unresolvable sid8s on landed pages plus
+  malformed Sources bullets (homoglyph separators, non-8-hex tokens — citation-
+  looking lines the strict resolver would otherwise silently skip). The manual
+  ingest review printout shows the same check as an advisory.
+- **New-page homonym guard.** Page identity is the filename stem, so two
+  concepts that slugify near-identically (`metro-di`/`metrodi`, cross-kind
+  `foo`) would silently become one page. A fold creating a NEW page whose
+  identity collides with an existing page (or another new page in the same
+  batch) is held; folding into an existing page — the normal case — is exempt
+  by construction, so the guard cannot false-positive on legitimate same-topic
+  folds. An internal guard error converts to a hold (fail-closed, never a crash
+  loop). Lint gains a `homonym` net over existing page identities.
+- **Frontmatter delimiter is line-anchored.** `parse_frontmatter` split on the
+  substring `---` anywhere, so a value containing a dash run truncated the
+  machine-read block and silently dropped every key after it (`ingested:`,
+  `sessionId:`, `source:` — the join keys). Found by the red-team pass and
+  confirmed live: one production journal entry was parsing 13 keys short.
+- **Auto-ingest commits exact paths.** The unattended batch commit passed the
+  bare `pages`/`journal` pathspecs, sweeping a user's concurrent hand-edits to
+  unrelated pages into an engine-authored commit. It now commits exactly the
+  written pages + flipped journal entries + `index.md`. (The interactive
+  `--accept` keeps the broad spec on purpose — there the user just reviewed the
+  whole diff, hand-fixes included.)
+
+### Changed
+
+- **Record preserves analytical outcomes.** The record prompt collapses a
+  session to a one-line summary ONLY when it left nothing a future session
+  could use; sessions with durable analytical conclusions — review verdicts,
+  comparison/measurement results, facts learned, decisions not to act — get a
+  `## Findings` section even with zero file changes. Measured on the live
+  corpus: ~15 of 27 one-line collapses were recoverable losses, including 12
+  security-review verdicts recorded as nothing. A new prompt rule requires
+  naming attack classes abstractly (like credentials), so review Findings can't
+  trip the injection gates. This narrows ARCHITECTURE.md's documented
+  "exploratory sessions collapse" trade.
+- **Fold-write description cap.** `_finalize_ingest_pages` deterministically
+  truncates an over-cap frontmatter description at write time (the same
+  transform record applies), so `desc_long` lint findings stop recurring.
+- **Companion re-split merges, never clobbers.** A page splitting again into an
+  existing `<slug>-sources` companion now APPENDS its newly-moved citations
+  (deduped, chronological); the previous overwrite deleted every
+  previously-archived citation — observed live during the July backlog fold.
+- **Lint corpus-size early warning.** The semantic review ships the whole
+  corpus in one LLM call; from 80% of `lint.single_call_token_budget` (default
+  100k tokens) the report + log warn so batched lint gets designed before the
+  sweep starts failing. (Corpus today: ~33k tokens.)
+
+Verified against the live corpus before release: the two new lint classes
+produce zero findings on real data (open count unchanged), and every existing
+citation resolves — the gates start clean.
+
 ## [0.1.7] - 2026-07-19
 
 Tuning release (companion to 0.1.6): retarget the record-stage reject classifier

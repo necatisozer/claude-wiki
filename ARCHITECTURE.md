@@ -206,9 +206,12 @@ These are deliberate departures the release consciously made:
 - **Budgets and the `ollama:<model>` backend descoped.** No `*_max_usd` budget knobs; cost is governed
   instead by `ingest.max_sessions_per_run`, `ingest.auto_max_batches`, and the `record.*` input caps.
 - **Sessions subsume notes.** No `query --save` / `wiki note` — recorded sessions are the memory
-  substrate, so a separate note-compounding surface was unnecessary. Known edge: the record step
-  collapses an exploratory session with no durable outcome to a one-line summary, so a purely
-  analytical Q&A session compounds only weakly — the trade accepted for keeping record cheap.
+  substrate, so a separate note-compounding surface was unnecessary (and generated answers must never
+  re-enter as sources). Since 0.1.8 the record step preserves durable *analytical* outcomes — review
+  verdicts, comparison results, facts learned, decisions not to act — as `## Findings` bullets even
+  when no file changed; only sessions that leave nothing a future session could use still collapse to
+  a one-line summary. (Before 0.1.8, every no-durable-outcome session collapsed — a documented trade
+  that measurably lost review verdicts.)
 - **The schema is fixed, not co-designed.** The original design invites each user to co-evolve their
   own schema document with their agent. A distributed plugin needs a stable editorial contract — the
   engine's gates and tests assume it — so one `SCHEMA.md` ships in `CODE_ROOT` for every install and
