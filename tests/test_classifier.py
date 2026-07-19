@@ -283,7 +283,9 @@ def _seed_ingestable(mode):
         "ingest": {"cron": "* * * * *", "enabled": True, "model": "x",
                    "max_sessions_per_run": 50, "auto_max_batches": 4, "mode": mode}}))
     sid = "abcd1234-0000-4000-8000-00000000aaaa"
-    jrel = "journal/2026/07/entry.md"
+    # v0.1.8: the journal FILENAME carries the sid8 (`__<sid8>.md`) — the citation-resolution gate
+    # resolves cited sid8s against journal filenames, so the fold's `abcd1234` citation must resolve.
+    jrel = "journal/2026/07/2026-07-06__session__abcd1234.md"
     (w / "journal" / "2026" / "07").mkdir(parents=True)
     (w / jrel).write_text("---\nname: Session\nsessionId: %s\ndate: 2026-07-06\ningested: false\n---\n"
                           "# Session\n\nwired the gateway.\n" % sid)

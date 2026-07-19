@@ -49,6 +49,11 @@ def _fresh(prefix, git=False):
     (d / "pages" / "topics").mkdir(parents=True)
     (d / "pages" / "projects").mkdir(parents=True)
     (d / "state").mkdir()
+    # v0.1.8: `_file_block` fixtures cite sid8 `deadbeef` — seed a matching journal entry so the
+    # citation-resolution gate resolves it (these cases pin OTHER hold reasons, not citations).
+    (d / "journal" / "2026" / "07").mkdir(parents=True)
+    (d / "journal" / "2026" / "07" / "2026-07-06__x__deadbeef.md").write_text(
+        "---\nname: X\nsessionId: deadbeef-0000-4000-8000-000000000000\ningested: false\n---\n# X\n\nnote\n")
     if git:
         def g(*a): return subprocess.run(["git", "-C", str(d)] + list(a), capture_output=True, text=True)
         subprocess.run(["git", "init", "-q", "-b", "main", str(d)], capture_output=True)
@@ -194,7 +199,7 @@ we = _fresh("rg4b_", git=True)
 (we / "config.json").write_text(json.dumps({"enabled": True,
     "ingest": {"cron": "* * * * *", "enabled": True, "model": "x", "max_sessions_per_run": 50, "auto_max_batches": 4}}))
 jrel = "journal/2026/07/entry.md"
-(we / "journal" / "2026" / "07").mkdir(parents=True)
+(we / "journal" / "2026" / "07").mkdir(parents=True, exist_ok=True)   # _fresh pre-seeds journal/ (v0.1.8)
 (we / jrel).write_text("---\nname: Session\nsessionId: deadbeef-1a1a-4003-9abc-000000000003\n"
                        "date: 2026-07-06\ningested: false\n---\n# Session\n\nwired the gateway.\n")
 SID = "deadbeef-1a1a-4003-9abc-000000000003"

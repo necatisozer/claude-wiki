@@ -69,9 +69,9 @@ print("ok I2: shape gate rejects executables + tracked hooks (hook-injection vec
 # =============================================================================================
 w = fresh_git_wiki()
 (w / "config.json").write_text(json.dumps({"enabled": True, "ingest": {"max_sessions_per_run": 50}}))
-jrel = "journal/2026/07/e.md"
+jrel = "journal/2026/07/2026-07-19__s__deadbeef.md"   # v0.1.8: filename sid8 resolves the fold's citation
 (w / "journal" / "2026" / "07").mkdir(parents=True)
-(w / jrel).write_text("---\nname: S\nsessionId: dead\ningested: false\n---\n# S\n\nx\n")
+(w / jrel).write_text("---\nname: S\nsessionId: deadbeef-1a1a-4003-9abc-000000000009\ningested: false\n---\n# S\n\nx\n")
 SID = "deadbeef-1a1a-4003-9abc-000000000009"
 conn = wiki.ledger()
 conn.execute("INSERT INTO sessions(session_id, project, page_path, summarized_at, summarized_by, date, "
