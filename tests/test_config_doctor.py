@@ -52,6 +52,21 @@ assert "record.input_max_chars" in r.stdout and "should be int" in r.stdout, \
     "doctor must flag a wrong-type value:\n" + r.stdout
 print("ok 1: doctor reports an unknown key + a wrong-type value (advisory)")
 
+# v0.1.12 — `activated_at` is STAMPED by the engine (_stamp_activated_at) and READ by
+# _reconcile_since as reconcile's lower bound, but has no DEFAULT_CONFIG entry. It must validate
+# clean: a healthy wiki reported an advisory unknown-key on a key the engine itself requires.
+w = wiki({"enabled": True, "activated_at": "2026-07-20T11:00:00Z"})
+r = run(["doctor"], w)
+assert r.returncode == 0, "activated_at must not gate doctor:\n" + r.stdout + r.stderr
+assert "unknown key 'activated_at'" not in r.stdout, \
+    "engine-stamped activated_at must validate clean:\n" + r.stdout
+# ...and the wrong TYPE is still caught (the exemption is a known-key entry, not a blanket skip)
+w = wiki({"enabled": True, "activated_at": 1234})
+r = run(["doctor"], w)
+assert "activated_at" in r.stdout and "should be str" in r.stdout, \
+    "a non-string activated_at must still be flagged:\n" + r.stdout
+print("ok 1b: activated_at validates clean; wrong type still flagged")
+
 # ============================================================================================
 # 2. config.local.json PARSE FAILURE → CRITICAL: doctor exits non-zero with a clear message.
 # ============================================================================================

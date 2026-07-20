@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.12] - 2026-07-20
+
+### Fixed
+
+- **`doctor` no longer flags a key the engine itself requires.** `activated_at`
+  is stamped into `config.json` by `_stamp_activated_at` and read by
+  `_reconcile_since` as reconcile's lower scan bound, but it has no
+  `DEFAULT_CONFIG` entry — and `_config_schema` derives its known-key set from
+  `DEFAULT_CONFIG` plus the runtime *sections*. So a perfectly healthy wiki
+  reported `config.json: unknown key 'activated_at'` on every `doctor` run.
+  Advisory-only, but it put permanent noise in a health check that should read
+  clean, and invited a "fix" by deleting the stamp — which would silently widen
+  reconcile's scan back to the `window_days` cap. Top-level runtime scalars now
+  have their own known-key map (`CONFIG_RUNTIME_SCALARS`). The entry is a typed
+  known key, not a blanket skip: a non-string `activated_at` is still flagged.
+
 ## [0.1.11] - 2026-07-20
 
 ### Fixed
