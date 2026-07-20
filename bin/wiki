@@ -3853,6 +3853,82 @@ def _post_pull_validate(before=None):
         return False, "unsafe pulled content (write-path parity): %s" % ", ".join(bad[:8])
     return True, ""
 
+# ------------------------------------------------- v0.1.13: derived-conflict auto-heal (multi-device)
+# Two devices folding the same day both rewrite `pages/` + `index.md`, so the second one to pull hits a
+# rebase conflict — and the old behavior (abort + flag + proceed) left that device DIVERGED until a
+# human resolved it by hand. But the data model already settles this: the JOURNAL is the source of
+# truth and pages are DERIVED from it (ingest folds journal → pages; `reindex_ledger` even re-seeds
+# ingested state from each entry's `ingested:` frontmatter). Journal files are one-per-session and can
+# never conflict. So when every local change since the merge base is a journal entry or a derived
+# artifact, the correct resolution is mechanical: take the remote's derived files wholesale, re-apply
+# this device's journal entries on top marked UN-ingested, and let the next ingest re-fold them. No
+# knowledge is lost — everything in a page is reconstructible from journal entries both devices hold.
+#
+# FAIL CLOSED: one local change outside journal/ + the derived set (config, prompts, docs, anything
+# authored) aborts the auto-heal and falls back to the flag-and-proceed path. Discarding a hand-edited
+# file to win a merge is never worth it. The pre-reset HEAD is also pinned to a `sync-preconflict`
+# branch first, so no local commit becomes unreachable even if the re-apply dies midway.
+_DERIVED_FILES = ("index.md", "lint-report.md")
+
+def _is_derived(rel):
+    return rel in _DERIVED_FILES or rel.startswith("pages/")
+
+def _mark_uningested(text):
+    """Flip the durable `ingested: true` frontmatter flag so the next ingest re-folds this entry."""
+    return re.sub(r"(?m)^ingested:[ \t]*true[ \t]*$", "ingested: false", text, count=1)
+
+def _clear_ledger_ingested(session_ids):
+    """reindex_ledger COALESCEs ingested_at, so an existing row keeps its stamp even after the
+    frontmatter flag flips — the re-fold must be forced in the DB too."""
+    if not session_ids:
+        return
+    with contextlib.suppress(Exception):
+        conn = ledger()
+        conn.executemany("UPDATE sessions SET ingested_at=NULL, ingested_by=NULL WHERE session_id=?",
+                         [(s,) for s in session_ids])
+        conn.commit()
+
+def _resolve_derived_conflict(branch):
+    """Heal a rebase conflict confined to DERIVED files. True = healed (HEAD now on top of remote)."""
+    remote = "origin/" + branch
+    if git_net("fetch", "origin", branch).returncode != 0:
+        return False
+    base = git("merge-base", "HEAD", remote)
+    if base.returncode != 0 or not base.stdout.strip():
+        return False
+    diff = git("diff", "--name-only", base.stdout.strip(), "HEAD")
+    if diff.returncode != 0:
+        return False
+    local = [p for p in diff.stdout.splitlines() if p.strip()]
+    if not local:
+        return False
+    if any(not (p.startswith("journal/") or _is_derived(p)) for p in local):
+        return False        # an authored file is in play — never auto-discard it
+    saved = {}
+    for rel in (p for p in local if p.startswith("journal/")):
+        blob = git("show", "HEAD:" + rel)
+        if blob.returncode == 0:
+            saved[rel] = blob.stdout
+    git("branch", "-f", "sync-preconflict", "HEAD")   # nothing becomes unreachable
+    if git("reset", "--hard", remote).returncode != 0:
+        return False
+    sids = []
+    for rel, text in saved.items():
+        p = WIKI / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(p, _mark_uningested(text))
+        with contextlib.suppress(Exception):
+            sid = parse_frontmatter(text).get("sessionId")
+            if sid:
+                sids.append(sid)
+    if saved:
+        git("add", "--", *sorted(saved))
+        git("commit", "-q", "-m",
+            "sync: re-applied %d local journal entr%s after derived-file conflict"
+            % (len(saved), "y" if len(saved) == 1 else "ies"))
+        _clear_ledger_ingested(sids)
+    return True
+
 def _sync_pull():
     """pull --rebase under the git-write lock; on failure abort the rebase, flag it, and PROCEED
     (sync must never wedge local work). A moved HEAD is gated by _post_pull_validate BEFORE it can
@@ -3868,9 +3944,15 @@ def _sync_pull():
         if pulled.returncode != 0:
             if (WIKI / ".git" / "rebase-merge").exists() or (WIKI / ".git" / "rebase-apply").exists():
                 git("rebase", "--abort")
-            _atomic_write(_pull_failed_file(), (pulled.stderr or pulled.stdout or "?").strip()[:300])
-            log("sync: pull failed (non-fatal):", (pulled.stderr or "?").strip()[:160])
-            return False
+            # v0.1.13 — multi-device: a conflict confined to DERIVED files heals itself (remote pages
+            # win; local journal is re-applied un-ingested for re-fold). Anything else flags as before.
+            if _resolve_derived_conflict(branch):
+                log("sync: derived-file conflict auto-resolved — remote pages kept, "
+                    "local journal re-applied for re-fold")
+            else:
+                _atomic_write(_pull_failed_file(), (pulled.stderr or pulled.stdout or "?").strip()[:300])
+                log("sync: pull failed (non-fatal):", (pulled.stderr or "?").strip()[:160])
+                return False
         after = git("rev-parse", "HEAD").stdout.strip()
         if after != before:
             ok, reason = _post_pull_validate(before)
