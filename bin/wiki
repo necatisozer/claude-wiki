@@ -3138,13 +3138,58 @@ SECRET_PATTERNS = [(n, re.compile(p)) for n, p in [
                     r"[A-Za-z0-9_\-]{32,}"),
 ]]
 
+# v0.1.11 — code-identifier exemption for the high_entropy catch-all (2026-07-20). The three-class
+# (lower+UPPER+digit) shape that defines a random credential is ALSO satisfied by every long
+# camelCase/snake_case code identifier, and a KMP/Android corpus is full of them:
+# `linkPodDebugFrameworkIosSimulatorArm64` (38) and the Kotlin/Native mangled symbol
+# `kniprot_cocoapods_AmplitudeSwift0_NSPredicateValidating` (55) both matched, which fail-closed the
+# whole `init` restore. The exclusions already listed above (git SHA, UUID, single-case base64) are
+# all "missing a character class" cases; identifiers miss none, so they need a STRUCTURAL test.
+#
+# The discriminator is word structure. Split the candidate into maximal case-runs and digit runs
+# (`NSPredicateValidating` → NS | Predicate | Validating) and require BOTH:
+#   * >=65% of characters live in alphabetic tokens of >=4 chars — identifiers are concatenated
+#     words, random keys are noise that only occasionally yields a 4+ same-case run; and
+#   * <=10% digits — identifiers carry a version/arch suffix at most (`Arm64` = 2/38 = 5%), while a
+#     base64url/base62 credential is ~16% digits by construction.
+# Measured over 200k synthetic base62/base64url keys per length: 0.107% of 32-64 char keys satisfy
+# both, versus 14/14 real-world identifiers exempted (lowest margin 0.71 vs the 0.65 gate). That
+# residual is acceptable HERE and only here: high_entropy is the unknown-provider BACKSTOP — every
+# named provider above (AWS/GitHub/Stripe/Google/Slack/JWT/assignment/conn_string) is matched by
+# shape and is unaffected by this filter, and the per-commit push gate remains a second line.
+_IDENT_TOK_RX = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
+
+def _looks_like_code_identifier(s):
+    """True when a high_entropy candidate decomposes into word-like tokens (a Gradle task, a mangled
+    symbol, a long camelCase name) rather than random credential bytes. See the note above."""
+    if not s:
+        return False
+    wordish = sum(len(t) for t in _IDENT_TOK_RX.findall(s) if t.isalpha() and len(t) >= 4)
+    digits = sum(1 for c in s if c.isdigit())
+    return wordish / len(s) >= 0.65 and digits / len(s) <= 0.10
+
+# Per-pattern veto: name → predicate that, when True for a match, means "not a credential". Only the
+# heuristic catch-all gets one; every named provider pattern stays absolute.
+_PATTERN_EXEMPT = {"high_entropy": _looks_like_code_identifier}
+
 def _mask(s):
     s = s.strip()
     return (s[:4] + "…" + s[-2:] + " (len %d)" % len(s)) if len(s) > 8 else "***"
 
+def _iter_secret_matches(text):
+    """(name, rx, match) for every pattern hit that survives its pattern's exemption predicate. The
+    single chokepoint shared by scan_secrets and _redact_secrets, so detection and redaction can
+    never disagree about what counts as a secret (the write-path parity the init gate relies on)."""
+    for name, rx in SECRET_PATTERNS:
+        exempt = _PATTERN_EXEMPT.get(name)
+        for m in rx.finditer(text):
+            if exempt and exempt(m.group(0)):
+                continue
+            yield name, rx, m
+
 def scan_secrets(text):
     """All high-confidence credential matches in text, MASKED. Never returns raw secrets."""
-    return [(name, _mask(m.group(0))) for name, rx in SECRET_PATTERNS for m in rx.finditer(text)]
+    return [(name, _mask(m.group(0))) for name, _rx, m in _iter_secret_matches(text)]
 
 def _redact_secrets(text):
     """Replace every secret-shaped span in `text` with its MASKED form (_mask). This is BOTH the WP1
@@ -3154,8 +3199,12 @@ def _redact_secrets(text):
     '… (len N)' (spaces + non-token chars) and re-matches no pattern."""
     if not text:
         return text
-    for _name, rx in SECRET_PATTERNS:
-        text = rx.sub(lambda m: _mask(m.group(0)), text)
+    for name, rx in SECRET_PATTERNS:
+        exempt = _PATTERN_EXEMPT.get(name)
+        if exempt:
+            text = rx.sub(lambda m: m.group(0) if exempt(m.group(0)) else _mask(m.group(0)), text)
+        else:
+            text = rx.sub(lambda m: _mask(m.group(0)), text)
     return text
 
 def _selfscan(repo_dirs, authored_only=False):

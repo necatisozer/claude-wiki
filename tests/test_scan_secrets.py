@@ -59,9 +59,29 @@ for benign in [
     "risk_live_" + "a" * 20,                              # 'sk_live_<20>' inside 'risk_' → stripe lookbehind blocks it
     src_line,                                             # engine-written `source:` path slug MUST NOT trip high_entropy
     code_path,                                            # quoted code path segment MUST NOT trip high_entropy
+    # --- v0.1.11: long code identifiers MUST NOT trip high_entropy. The first two are the exact
+    # strings that fail-closed a real `init` restore (KMP journal entries); the rest are the same
+    # shape from Gradle/Compose/Kotlin-Native naming. All satisfy lower+UPPER+digit at >=32 chars.
+    "iOS linkPodDebugFrameworkIosSimulatorArm64: OK",
+    "symbol kniprot_cocoapods_AmplitudeSwift0_NSPredicateValidating multiply defined",
+    "ran assembleDebugAndroidTestSourcesJavaWithJavac",
+    "observeAuthenticatedPaymentStateDataFlow emits twice",
+    "collectAsStateWithLifecycle_rememberCoroutineScope",
+    "bumped MARKETING_VERSION_CURRENT_PROJECT_VERSION_bump",
 ]:
     lines, rc = probe(benign)
     assert rc == 0, "false positive on: %r → %s" % (benign, lines)
+
+# --- v0.1.11: the identifier exemption must NOT swallow real credentials. Every positive above
+# already covers the named patterns; these are high_entropy-shaped blobs that are NOT word-like
+# (digit-dense and/or no long alphabetic tokens) and so must still HIT.
+for i, keyish in enumerate([
+    "Ab1" * 12,                                           # 36 chars, 33% digits → not identifier-shaped
+    "x7Kq" + "9Zm2Pv4Ln8Rt6Wy3Bc5Df1Gh0Jk" + "Qs2Vx",      # scattered digits, no 4+ word run
+    "aB3" + "".join("cD%d" % d for d in range(10)) + "eF" + "gH" * 4,   # runtime-built, no literal run
+]):
+    lines, rc = probe("token = " + keyish)
+    assert rc == 1 and lines, "high_entropy positive %d must still HIT: %r" % (i, keyish[:12])
 
 # --- the permanent self-scan: every authored tracked file in THIS repo must be clean ---
 # (the live data repo is deliberately NOT scanned here — it doesn't exist on CI and its

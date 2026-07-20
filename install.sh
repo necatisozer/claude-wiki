@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # claude-wiki one-line installer: plugin install + memory init/restore.
-#   curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.10/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.11/install.sh | bash
 #   curl -fsSL … | bash -s -- owner/repo     # explicit memory repo (restore TARGET)
 # Non-interactive by necessity (curl|bash has no usable stdin) → passes --yes to `wiki init`.
 # For interactive confirms: download this file and run it directly.
@@ -19,7 +19,7 @@ fi
 # unsafe after the 0.1.0 fresh-root history reset — a stale pre-reset clone (1.x) beats 0.x
 # numerically forever while its `git pull` (how `marketplace update` refreshes) permanently
 # fails against the unrelated new history, so it would silently keep serving the old engine.
-EXPECT="0.1.10"
+EXPECT="0.1.11"
 MANIFEST="$HOME/.claude/plugins/marketplaces/claude-wiki/.claude-plugin/plugin.json"
 mkt_version() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version",""))' "$MANIFEST" 2>/dev/null || true; }
 claude plugin marketplace add necatisozer/claude-wiki >/dev/null 2>&1 || true
