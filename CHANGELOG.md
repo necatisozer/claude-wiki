@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.11] - 2026-07-20
+
+### Fixed
+
+- **Code identifiers no longer read as credentials.** The `high_entropy`
+  catch-all flags any ≥32-char run mixing lower + UPPER + digit — a shape that
+  describes a random API key *and* every long camelCase/snake_case identifier.
+  On a real KMP corpus `linkPodDebugFrameworkIosSimulatorArm64` (38) and the
+  Kotlin/Native mangled symbol
+  `kniprot_cocoapods_AmplitudeSwift0_NSPredicateValidating` (55) both matched,
+  and because the gate is fail-closed, two false positives refused an entire
+  `init` restore. The exclusions already in place (git SHA, UUID, single-case
+  base64) all work by *missing a character class*; identifiers miss none, so
+  they needed a structural test. A candidate is now exempt when it decomposes
+  into word-like tokens: ≥65% of characters in alphabetic tokens of ≥4 chars
+  **and** ≤10% digits. Measured over 200k synthetic keys per length, 0.107% of
+  32–64 char credentials satisfy both, against 14/14 real identifiers exempted.
+  The relaxation is confined to the unknown-provider backstop — every named
+  provider pattern (AWS, GitHub, Stripe, Google, Slack, JWT, `assignment`,
+  `conn_string`) remains absolute, and the per-commit push gate is unchanged.
+
+### Changed
+
+- `scan_secrets` and `_redact_secrets` now share one `_iter_secret_matches`
+  chokepoint, so detection and redaction cannot disagree about what counts as a
+  secret — the write-path parity the init gate depends on.
+
 ## [0.1.10] - 2026-07-20
 
 ### Added
