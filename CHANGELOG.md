@@ -5,6 +5,40 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.13] - 2026-07-20
+
+### Added
+
+- **Multi-device derived-file conflict auto-heal.** Two devices folding on the
+  same schedule both rewrite `pages/` and `index.md`, so the second to pull hit
+  a rebase conflict — and the old path (abort, flag, proceed) left that device
+  silently diverged until a human resolved it by hand. The data model already
+  settles this: the journal is the source of truth and pages are *derived* from
+  it (ingest folds journal → pages; `reindex_ledger` re-seeds ingested state
+  from each entry's `ingested:` frontmatter), and journal files are
+  one-per-session so they can never conflict. When every local change since the
+  merge base is a journal entry or a derived artifact, the conflict now resolves
+  mechanically: the remote's derived files are taken wholesale, this device's
+  journal entries are re-applied on top marked **un-ingested**, and the next
+  ingest re-folds them. Nothing is lost — every page is reconstructible from
+  journal entries both devices already hold.
+- **Fails closed.** A single local change outside `journal/` and the derived set
+  (config, prompts, docs — anything authored) aborts the auto-heal and falls
+  back to flag-and-proceed. Discarding a hand-edited file to win a merge is
+  never the right trade. The pre-reset HEAD is pinned to a `sync-preconflict`
+  branch first, so no local commit becomes unreachable even if the re-apply
+  dies midway. The post-pull validation gate still runs on the healed HEAD.
+- Ledger `ingested_at` is cleared explicitly for re-applied entries —
+  `reindex_ledger` COALESCEs that column, so the frontmatter flip alone would
+  not have forced the re-fold.
+
+### Note
+
+`ingest.cron` lives in the synced `config.json`, so every device inherits the
+same fold schedule and collides by construction. Stagger it per device via the
+local-only `state/config.local.json` (deep-merges over `config.json`):
+`{"ingest": {"cron": "30 21 * * *"}}`.
+
 ## [0.1.12] - 2026-07-20
 
 ### Fixed
