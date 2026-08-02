@@ -342,10 +342,63 @@ def is_summarized(conn, sid):
     return bool(r and r[0])
 
 # ---------------------------------------------------------------- transcript cleaner
+def _repo_name_from_url(url):
+    """Last path segment of a git remote URL, `.git` stripped — or None if it isn't a clean
+    label. Covers every form `remote get-url` can emit: https://host/owner/repo(.git),
+    scp-style git@host:owner/repo(.git), ssh://…, and bare local paths. The result lands in
+    journal frontmatter, the ledger and the FTS index, so anything that isn't a single safe
+    token (path separators, spaces, `.`/`..`) is rejected rather than sanitized — a bad parse
+    must fall back to the basename, never mint a malformed project."""
+    u = re.split(r"[?#]", (url or "").strip(), 1)[0].rstrip("/")
+    if not u:
+        return None
+    seg = re.split(r"[/:]", u)[-1]                 # scp-style separates host from path with ':'
+    if seg.endswith(".git"):
+        seg = seg[:-4]
+    return seg if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", seg) and seg not in (".", "..") else None
+
+_ORIGIN_CACHE = {}
+
+def _git_origin_name(cwd):
+    """Repo name of `cwd`'s `origin`, or None. Read-only, fail-quiet and hard-bounded: this sits
+    on the SessionStart digest path, so a missing dir, a non-repo, an unreachable mount or a
+    slow FS must each cost ~nothing and fall through to the basename. `-C` (not cwd=) so a
+    deleted directory errors inside git instead of raising out of subprocess. Never touches the
+    network — get-url reads .git/config — and GIT_TERMINAL_PROMPT=0 keeps any credential helper
+    from blocking a hook. Cached per process: reconcile/backfill label up to 50 rows in a loop."""
+    key = str(cwd)
+    if key not in _ORIGIN_CACHE:
+        name = None
+        try:
+            r = subprocess.run(["git", "-C", key, "--no-pager", "remote", "get-url", "origin"],
+                               capture_output=True, text=True, timeout=5,
+                               env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
+                                    "GIT_OPTIONAL_LOCKS": "0"})
+            if r.returncode == 0:
+                name = _repo_name_from_url(r.stdout)
+        except (subprocess.TimeoutExpired, OSError):
+            name = None
+        _ORIGIN_CACHE[key] = name
+    return _ORIGIN_CACHE[key]
+
 def project_label(cwd):
+    """The project a session belongs to — identified by its REPOSITORY, not its directory.
+
+    The bare basename made a project out of every git worktree (`…/.worktrees/issue-42`),
+    scratch dir and `~/Downloads`; worse, because a rename moves the checkout but not the repo, it
+    let one project's sessions be folded into another project's page. `origin`'s repo name is
+    stable across all of that, and git resolves it identically from a worktree, a submodule or any
+    subdirectory. Basename stays the fallback for anything with no repo or no origin (`~/Downloads`,
+    a fresh un-pushed checkout) — that is exactly how every pre-existing label was derived, so
+    repos whose directory already matches their remote keep the label they have.
+
+    HOME is checked FIRST and unconditionally: WP2 ROW 5 makes it the running user's home rather
+    than a baked-in name, and that must not become a dotfiles repo's name on machines where `~`
+    is itself a checkout."""
     if not cwd: return "unknown"
     seg = Path(cwd).name
-    return "home" if seg == HOME.name else seg     # WP2 ROW 5 — running user's home, not a baked-in name
+    if seg == HOME.name: return "home"             # WP2 ROW 5 — running user's home, not a baked-in name
+    return _git_origin_name(cwd) or seg
 
 # WP2 ROW — projects.exclude (record-time privacy). Config `projects.exclude` is a list of path
 # prefixes the user never wants captured; a session whose cwd falls under one is short-circuited in
