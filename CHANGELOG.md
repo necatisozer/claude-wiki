@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.15] - 2026-08-02
+
+### Fixed
+
+- **A session's project is now identified by its git remote, not its working
+  directory.** `project_label()` returned the cwd basename, so the label was
+  whatever directory the session happened to sit in. Every git worktree became a
+  project of its own — a repo's per-ticket worktrees each produced a throwaway
+  single-session "project" — as did directories with no repository at all
+  (`~/Downloads`, a bare projects parent). The serious case is attribution:
+  because a rename moves the checkout but not the repo, one project's sessions
+  could be folded into a *different* project's page, and such a batch can
+  survive repeated clean lint sweeps, since lint detects inconsistency and a
+  uniformly-wrong label is perfectly consistent.
+
+  `origin`'s repo name is stable across all of it — git resolves it identically
+  from a worktree, a submodule, or any subdirectory. The lookup is read-only
+  (`remote get-url` reads `.git/config`, never the network), 5s-capped,
+  fail-quiet and cached per process, so the SessionStart digest path is
+  unaffected.
+
+  The basename remains the fallback for anything with no repo or no origin
+  (`~/Downloads`, a fresh un-pushed checkout) — which is how every pre-existing
+  label was derived, so **repos whose directory already matches their remote
+  keep the label they have and no existing history is re-labeled**. `HOME` keeps
+  its unconditional special case, so a dotfiles checkout at `~` cannot rename it.
+
+  Malformed or unparseable remotes fall back to the basename rather than being
+  sanitized: a bad parse must never mint a malformed project name into journal
+  frontmatter, the ledger and the FTS index.
+
 ## [0.1.14] - 2026-08-02
 
 ### Fixed
