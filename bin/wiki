@@ -4891,6 +4891,52 @@ def _dangling_sources():
                 gone += 1
     return tot, gone
 
+def _scrub_scan():
+    """Retro-scan the synced transcripts with the CURRENT secret patterns. Each transcripts/*.jsonl.gz
+    was redacted with the patterns of its upload day and then committed forever — every later pattern
+    improvement creates a blind spot nothing re-checks. Masks are idempotent (they re-match no
+    pattern), so any hit here is by construction content the upload-day patterns missed but today's
+    would catch. Cached per (file sha256, engine version) in state/scrub_scan.json: steady-state cost
+    is zero; a plugin update triggers one full re-pass. Returns (total, {sid8: [pattern classes]}) —
+    classes only, NEVER matched text."""
+    import gzip, hashlib
+    ver = _manifest_version(CODE_ROOT) or "dev"
+    cache_fp = WIKI / "state" / "scrub_scan.json"
+    cache = {}
+    with contextlib.suppress(Exception):
+        cache = json.loads(cache_fp.read_text())
+    out, total, new_cache = {}, 0, {}
+    for p in sorted(glob.glob(str(WIKI / "transcripts" / "*.jsonl.gz"))):
+        total += 1
+        name = os.path.basename(p)
+        try:
+            h = hashlib.sha256(Path(p).read_bytes()).hexdigest()
+        except Exception:
+            continue
+        ent = cache.get(name)
+        if not (isinstance(ent, dict) and ent.get("hash") == h and ent.get("ver") == ver):
+            classes = set()
+            try:
+                with gzip.open(p, "rt", errors="replace") as f:
+                    for line in f:
+                        line = line[:1_000_000]        # bounded per line, same cap as the cleaner
+                        for cname, rx in SECRET_PATTERNS:
+                            exempt = _PATTERN_EXEMPT.get(cname)
+                            for m in rx.finditer(line):
+                                if not (exempt and exempt(m.group(0))):
+                                    classes.add(cname)
+                                    break
+            except Exception:
+                continue                               # unreadable archive — skip, retry next run
+            ent = {"hash": h, "ver": ver, "classes": sorted(classes)}
+        new_cache[name] = ent
+        if ent.get("classes"):
+            out[name[:8]] = ent["classes"]
+    with contextlib.suppress(Exception):
+        (WIKI / "state").mkdir(parents=True, exist_ok=True)
+        _atomic_write(cache_fp, json.dumps(new_cache, separators=(",", ":")))
+    return total, out
+
 def cmd_doctor(args):
     # WP4 ROW 2 — doctor hardening: exits NON-ZERO on a genuine failure (CI/automation can gate on it);
     # each external probe has a ~20s timeout; surfaces last-record success/error + a stale-capture note.
@@ -5015,6 +5061,18 @@ def cmd_doctor(args):
          "all %d journal source transcript(s) still on disk" % tot if gone == 0 else
          "%d/%d journal source transcript(s) already deleted by Claude Code's cleanupPeriodDays — "
          "raise it in settings.json to keep raw transcripts longer" % (gone, tot))
+    # Retro-scrub (advisory): synced transcripts were redacted with UPLOAD-DAY patterns; re-scan
+    # with today's so pattern improvements retroactively audit old uploads. Classes + sid8s only —
+    # matched text is never printed.
+    stot, flagged = _scrub_scan()
+    if not flagged:
+        line("scrub", True, "all %d synced transcript(s) clean under current patterns" % stot)
+    else:
+        sids = ", ".join(sorted(flagged)[:3]) + ("…" if len(flagged) > 3 else "")
+        classes = ", ".join(sorted({c for cl in flagged.values() for c in cl})[:5])
+        line("scrub", False,
+             "%d/%d synced transcript(s) hold now-detectable secret shape(s) [%s] (sids: %s) — "
+             "rotate the credential(s); re-redact + history rewrite optional" % (len(flagged), stot, classes, sids))
     return 1 if fails[0] else 0
 
 def main():
