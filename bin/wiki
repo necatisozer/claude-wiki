@@ -303,6 +303,39 @@ def _archive_transcript(tpath, sid, cfg):
     except Exception as e:
         log("record: transcript archive skipped (non-fatal):", repr(e))
 
+def _sync_transcript(tpath, sid, cfg):
+    """Opt-in cross-device transcript copy (`record.sync_transcripts`): a SECRET-REDACTED, gzipped
+    copy of the raw transcript written as a TRACKED transcripts/<sid>.jsonl.gz, committed and
+    pushed with the record exactly like a journal entry. Same trust class as the journal — nothing
+    lands unredacted. Redaction runs line-by-line BEFORE compression: the pre-push scanner cannot
+    see inside a .gz, so the write path is the gate here, the same posture as journal write-time
+    redaction. Never raises — the copy must not fail a record."""
+    try:
+        if not cfg.get("record", {}).get("sync_transcripts", False):
+            return
+        import gzip
+        d = WIKI / "transcripts"
+        d.mkdir(parents=True, exist_ok=True)
+        dst, tmp = d / ("%s.jsonl.gz" % sid), d / (".%s.tmp" % sid)
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()                              # crash leftover — O_EXCL below would refuse it
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(tmp), flags, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb") as gz, \
+                 open(tpath, "r", errors="replace") as src:
+                for line in src:                      # SECRET_PATTERNS are single-line — per-line is exact
+                    gz.write(_redact_secrets(line).encode("utf-8"))
+            if tmp.stat().st_size > 95_000_000:       # GitHub refuses files ≥100 MB — skip, keep local tiers
+                log("record: transcript sync skipped (too large for the remote)")
+                return
+            os.replace(tmp, dst)
+        finally:
+            with contextlib.suppress(Exception):
+                tmp.unlink()
+    except Exception as e:
+        log("record: transcript sync skipped (non-fatal):", repr(e))
+
 def _log_max_bytes():
     """wiki.log rotation cap. WIKI_LOG_MAX_BYTES overrides LOG_MAX_BYTES (tests pin a tiny cap)."""
     try:
@@ -1160,6 +1193,7 @@ def cmd_record(args):
                  now_iso(), trigger, page, prev_ingested_at, prev_ingested_by, None, ended[:10], title, desc))
             conn.commit()
             _archive_transcript(tpath, sid, cfg)     # opt-in raw-source durability (local, untracked)
+            _sync_transcript(tpath, sid, cfg)        # opt-in cross-device tier (redacted, tracked)
             _oplog("record", "%s %s" % (sid[:8], page))
             _record_sync_commit_push(old_page, page, slugify(title), sid)   # sync: commit+push (no-op unless enabled)
             log("record: wrote", page, "cost=$%s" % cost,
@@ -3495,7 +3529,10 @@ DEFAULT_CONFIG = {
                # Opt-in raw-source durability: gzip-copy each kept session's transcript into the
                # untracked state/transcripts/ (Claude Code deletes the original after
                # cleanupPeriodDays). Local only — never synced.
-               "archive_transcripts": False},
+               "archive_transcripts": False,
+               # Opt-in cross-device tier: a secret-REDACTED gzip copy as a tracked
+               # transcripts/<sid>.jsonl.gz, committed + pushed with the record.
+               "sync_transcripts": False},
     "digest": {"recent_sessions": 12, "max_chars": 4000, "max_recent_lines": 20,
                "project_scope": False},
     # WP4 ROW 1 — reconcile (auto crash-gap catch-up in `maintain`): scan sessions newer than
@@ -3891,6 +3928,9 @@ def _record_sync_commit_push(old_page, page, slug, sid):
                 paths.insert(0, old_page)
         if (WIKI / "log.md").exists():
             paths.append("log.md")                  # the op-log line for this record rides along
+        trel = "transcripts/%s.jsonl.gz" % sid
+        if (WIKI / trel).exists():
+            paths.append(trel)                      # the redacted synced copy rides along too
         git_commit_paths("record: %s %s" % (slug, sid[:8]), *paths)
         if cfg.get("auto_push", True):
             engine = str(Path(__file__).resolve())

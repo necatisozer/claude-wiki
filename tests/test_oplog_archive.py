@@ -80,4 +80,22 @@ assert gzip.decompress(dst.read_bytes()) == src.read_bytes(), "re-record must re
 wiki._archive_transcript(str(src) + ".missing", sid, on)                           # must not raise
 print("ok 3: opt-in gating, byte-faithful round-trip, overwrite on growth, bad source tolerated")
 
+# =============================================================================================
+# 4. _sync_transcript: off by default; on → TRACKED transcripts/<sid>.jsonl.gz whose content is
+#    secret-REDACTED (the whole point — nothing lands unredacted in the synced repo).
+# =============================================================================================
+secret = "AKIA" + "B" * 16                    # built at runtime — no credential-shaped literal
+src2 = _mkdtemp("oa_tr2_") / "t.jsonl"
+src2.write_text('{"text":"key is %s here"}\n{"text":"plain line"}\n' % secret)
+sdst = W / "transcripts" / ("%s.jsonl.gz" % sid)
+
+wiki._sync_transcript(str(src2), sid, {})                                          # default: off
+assert not sdst.exists(), "synced copy must be OPT-IN"
+wiki._sync_transcript(str(src2), sid, {"record": {"sync_transcripts": True}})
+out = gzip.decompress(sdst.read_bytes()).decode()
+assert secret not in out, "secret must be redacted before the tracked copy lands"
+assert "plain line" in out and "(len" in out, "non-secret content kept, mask marker present"
+wiki._sync_transcript(str(src2) + ".missing", sid, {"record": {"sync_transcripts": True}})
+print("ok 4: synced copy opt-in, redacted, non-secret content intact, bad source tolerated")
+
 print("PASS test_oplog_archive")
