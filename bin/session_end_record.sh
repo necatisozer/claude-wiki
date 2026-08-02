@@ -6,8 +6,9 @@
 payload="$(cat)"
 [ -z "$payload" ] && exit 0
 
-ENGINE_DIR="${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/wiki}"   # code (plugin); falls back to the data repo for dev
-export WIKI_HOME="${WIKI_HOME:-$HOME/.claude/wiki}"      # data
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"         # honor Claude Code's config-dir relocation knob
+ENGINE_DIR="${CLAUDE_PLUGIN_ROOT:-$CLAUDE_DIR/wiki}"     # code (plugin); falls back to the data repo for dev
+export WIKI_HOME="${WIKI_HOME:-$CLAUDE_DIR/wiki}"        # data
 mkdir -p "$WIKI_HOME/logs"
 
 # Launch fully detached so session exit is never blocked (spike-verified to survive teardown).

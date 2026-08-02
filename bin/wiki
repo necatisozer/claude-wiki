@@ -41,9 +41,13 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 HOME = Path.home()
-WIKI = Path(os.environ.get("WIKI_HOME", str(HOME / ".claude" / "wiki")))
+# Claude Code's config dir — honor its own relocation knob (CLAUDE_CONFIG_DIR) with the stock
+# ~/.claude fallback, so transcript scans (reconcile/backfill) and plugin-path checks follow a
+# relocated install instead of silently scanning an empty ~/.claude.
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or str(HOME / ".claude"))
+WIKI = Path(os.environ.get("WIKI_HOME", str(CLAUDE_DIR / "wiki")))
 CODE_ROOT = Path(__file__).resolve().parent.parent   # ships prompts/ + SCHEMA.md; == WIKI pre-packaging, ${CLAUDE_PLUGIN_ROOT} after
-PROJECTS = HOME / ".claude" / "projects"
+PROJECTS = CLAUDE_DIR / "projects"
 
 # WP2 ROW 4 — transport hardening. Pin git's allowed remote protocols process-wide so EVERY git/gh
 # child (clone/fetch/push/ls-remote/remote add — all inherit os.environ) refuses ext::/fd:: remote
@@ -1039,7 +1043,7 @@ def _stale_cache_engine():
     None (can't judge; also keeps tests with an overridden HOME out of the guard's blast radius)."""
     if "/plugins/cache/" not in str(CODE_ROOT).replace("\\", "/"):
         return None
-    inst = _manifest_version(HOME / ".claude" / "plugins" / "marketplaces" / "claude-wiki")
+    inst = _manifest_version(CLAUDE_DIR / "plugins" / "marketplaces" / "claude-wiki")
     if inst is None:
         return None
     mine = _manifest_version(CODE_ROOT)
@@ -3845,7 +3849,7 @@ def _engine_for_hook():
     GUARD: a marketplace clone can also be a PRE-RELEASE checkout that predates this very command
     (e.g. still the version before `_scrub-check` shipped) — probe it on empty stdin before trusting
     it, else every push would fail-close forever with `unknown command: _scrub-check`."""
-    stable = HOME / ".claude" / "plugins" / "marketplaces" / "claude-wiki" / "bin" / "wiki"
+    stable = CLAUDE_DIR / "plugins" / "marketplaces" / "claude-wiki" / "bin" / "wiki"
     if stable.is_file():
         try:
             probe = subprocess.run([sys.executable, str(stable), "_scrub-check"],
@@ -4894,11 +4898,11 @@ def cmd_doctor(args):
     # version-keyed cache dirs a not-yet-restarted Claude Code process could still be executing.
     # Advisory: presence of old cache dirs is normal; the guard (record/maintain) blocks actual use.
     mine, inst = _manifest_version(CODE_ROOT), \
-        _manifest_version(HOME / ".claude" / "plugins" / "marketplaces" / "claude-wiki")
+        _manifest_version(CLAUDE_DIR / "plugins" / "marketplaces" / "claude-wiki")
     stale = _stale_cache_engine()
     others = []
     with contextlib.suppress(Exception):
-        cache = HOME / ".claude" / "plugins" / "cache" / "claude-wiki" / "wiki"
+        cache = CLAUDE_DIR / "plugins" / "cache" / "claude-wiki" / "wiki"
         others = sorted(p.name for p in cache.iterdir() if p.is_dir() and p.name != (inst or ""))
     if stale:
         line("version", False, "RUNNING engine %s != installed %s — restart Claude Code" % stale)
