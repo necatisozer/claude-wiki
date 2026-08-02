@@ -11,6 +11,7 @@ Focus on what code can't detect — SEMANTIC issues visible only across the WHOL
 - **Stale / resolved:** "Active threads" or open items that another page shows are already done.
 - **Split candidates (bloat):** a project page so large that cross-cutting detail should move to a linked topic page — name the specific sections to extract and the topic slug to extract them to.
 - **Miscategorization:** a project page that's really a topic (or vice versa).
+- **Suggested questions:** at most 5 questions the HUMAN should answer to keep the wiki current — an "Active threads" item that looks untouched long after its page's `updated:` date ("[[rollakmp]]: is the TestFlight build-number sync strategy still undecided?"), a follow-up that recurs across pages without a recorded outcome, or a `status: contradicted` page whose conflict no page resolves. Questions only — never proposed page edits, never new-source research tasks, and NO severity tags in this section (questions are prompts for the human, not findings).
 
 Briefly confirm or dismiss each deterministic finding you were given — but treat them as **authoritative for anything mechanical** (line counts, link resolution, frontmatter presence, duplicate slugs). You cannot count lines or resolve links reliably by eye, so **never override a mechanical result with your own estimate**: build on it (e.g. suggest *what* to extract only when code actually flagged bloat), don't contradict it.
 
@@ -30,5 +31,7 @@ Output format — terse markdown only, every item citing specific `[[slugs]]` an
 - none
 ## Deterministic findings — confirm/dismiss
 - ...
+## Suggested questions
+- none
 
 Write "- none" for any empty section — and **prefer "- none" over a weak finding: only report issues genuinely worth acting on, don't manufacture nitpicks to fill sections (a healthy wiki is mostly "- none").** No preamble, no page rewrites, no closing commentary.

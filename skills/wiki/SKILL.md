@@ -118,6 +118,10 @@ When `lint-report.md` has findings (surfaced in the digest + `wiki status`), the
 3. **Fixes only what the user directs** — verifying each flagged claim against its source journal (by
    `sessionId`) first, then committing per fix.
 
+The report's **Suggested questions** section is not a findings list: the questions are prompts for
+the *user* to answer ("is thread X still real?"), never work items for the session to act on
+unprompted. Relay them; don't resolve them.
+
 A **stale-page** finding (`slug(Nd)`) is report-only: the engine never edits the page. Clear it by
 re-verifying the page's claims and bumping `updated:`, letting a fold touch it naturally, or setting
 a non-`active` status (`archived`) if the page is deliberately dormant.
