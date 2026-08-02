@@ -254,6 +254,51 @@ def _safe_append(fp, text):
     with os.fdopen(fd, "a") as f:
         f.write(text)
 
+OPLOG_HEADER = ("# Operations log — append-only; one `- <utc-iso> · <kind> · <detail>` line per "
+                "record / ingest / lint / retention pass. Engine-written, grep/cut-parseable.\n\n")
+
+def _oplog(kind, detail):
+    """One appended line in the data repo's `log.md` — the durable, unix-parseable chronological
+    record of engine operations (the ledger is machine-only sqlite; logs/wiki.log rotates away).
+    Detail is engine-computed (counts, sid8s, slugs already public in filenames) — never model
+    prose. Committed alongside the operation that wrote it. Never raises."""
+    try:
+        fp = WIKI / "log.md"
+        if not fp.exists():
+            _safe_append(fp, OPLOG_HEADER)
+        _safe_append(fp, "- %s · %s · %s\n" % (now_iso(), kind, detail))
+    except Exception:
+        pass
+
+def _archive_transcript(tpath, sid, cfg):
+    """Opt-in raw-source durability (`record.archive_transcripts`): gzip-copy the session
+    transcript into the UNTRACKED state/transcripts/ before Claude Code's cleanupPeriodDays
+    deletes it. Local only — state/ is gitignored, so raw (pre-redaction, secret-bearing) text
+    never enters the synced repo. Same-dir temp + rename; a re-record overwrites (transcripts are
+    append-only, so newer is a superset). Never raises — archival must not fail a record."""
+    try:
+        if not cfg.get("record", {}).get("archive_transcripts", False):
+            return
+        import gzip
+        d = WIKI / "state" / "transcripts"
+        d.mkdir(parents=True, exist_ok=True)
+        dst, tmp = d / ("%s.jsonl.gz" % sid), d / (".%s.tmp" % sid)
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()                              # crash leftover — O_EXCL below would refuse it
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(tmp), flags, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb") as gz, \
+                 open(tpath, "rb") as src:
+                for chunk in iter(lambda: src.read(1 << 20), b""):
+                    gz.write(chunk)
+            os.replace(tmp, dst)
+        finally:
+            with contextlib.suppress(Exception):
+                tmp.unlink()
+    except Exception as e:
+        log("record: transcript archive skipped (non-fatal):", repr(e))
+
 def _log_max_bytes():
     """wiki.log rotation cap. WIKI_LOG_MAX_BYTES overrides LOG_MAX_BYTES (tests pin a tiny cap)."""
     try:
@@ -1110,6 +1155,8 @@ def cmd_record(args):
                 (sid, project, tpath, now_iso(), stats["messages"], mtime,
                  now_iso(), trigger, page, prev_ingested_at, prev_ingested_by, None, ended[:10], title, desc))
             conn.commit()
+            _archive_transcript(tpath, sid, cfg)     # opt-in raw-source durability (local, untracked)
+            _oplog("record", "%s %s" % (sid[:8], page))
             _record_sync_commit_push(old_page, page, slugify(title), sid)   # sync: commit+push (no-op unless enabled)
             log("record: wrote", page, "cost=$%s" % cost,
                 "unknown_types=%s" % (sorted(stats["unknown_types"]) or "-"))
@@ -2274,7 +2321,8 @@ def _ingest_auto_batch(cfg, conn):
     # a broad pathspec would sweep the user's concurrent hand-edits to unrelated pages into an
     # engine-authored commit. (The interactive --accept flow keeps the broad spec on purpose — there
     # the user just reviewed the whole diff, hand-fixes included.)
-    batch_paths = [p for p in written + ["index.md"] + [pp for _, pp in rows if pp]
+    _oplog("ingest", "%d session(s) → %s" % (len(rows), slugs))
+    batch_paths = [p for p in written + ["index.md", "log.md"] + [pp for _, pp in rows if pp]
                    if (WIKI / p).exists()]
     r = git_commit_paths("ingest (auto): %d sessions → %s" % (len(rows), slugs), *batch_paths)
     if r.returncode != 0:
@@ -2569,8 +2617,9 @@ def run_lint(cfg):
         _atomic_write(flag, str(open_n))
     elif flag.exists():
         flag.unlink()
+    _oplog("lint", "%d structural finding(s)" % open_n)
     git_commit_paths("lint: weekly full-wiki sweep (%s, %d structural finding(s))" % (now_iso()[:10], open_n),
-                     "lint-report.md")
+                     "lint-report.md", "log.md")
     log("lint: report written, %d structural findings ($%s)" % (open_n, cost))
     return report
 
@@ -2938,7 +2987,9 @@ def cmd_ingest(args):
             r = conn.execute("SELECT page_path FROM sessions WHERE session_id=?", (sid,)).fetchone()
             if r: _flip_journal_ingested(r[0])   # durable flag, committed with the accept below
         dirty = bool(git("status", "--porcelain", "--", "pages", "index.md", "journal").stdout.strip())
-        rc = git_commit_paths("ingest: %d sessions → topics/projects" % len(pend), "pages", "index.md", "journal")
+        _oplog("ingest", "%d session(s) → topics/projects (accepted)" % len(pend))
+        rc = git_commit_paths("ingest: %d sessions → topics/projects" % len(pend), "pages", "index.md", "journal",
+                              "log.md")
         if dirty and rc.returncode != 0:
             # v0.1.5 (integrity-audit I3/I5): there WERE staged changes and the commit failed —
             # accepting now would mark sessions folded with nothing landed. Keep the pending
@@ -3140,10 +3191,11 @@ def _journal_retention(cfg):
     finally:
         conn.close()
     # commit the moves — both the journal-side removal and the archive-side addition are under 'journal'.
-    git_commit_paths("journal retention: archived %d entr%s older than %dd"
-                     % (len(moved), "y" if len(moved) == 1 else "ies", days), "journal")
     msg = ("archived %d journal entr%s older than %dd"
            % (len(moved), "y" if len(moved) == 1 else "ies", days))
+    _oplog("retention", msg)
+    git_commit_paths("journal retention: archived %d entr%s older than %dd"
+                     % (len(moved), "y" if len(moved) == 1 else "ies", days), "journal", "log.md")
     log("retention:", msg)
     print(msg)                                        # `wiki maintain` (direct) reports what it did
     return len(moved)
@@ -3435,7 +3487,11 @@ DEFAULT_CONFIG = {
     "enabled": True,
     "schema_version": ENGINE_SCHEMA,   # stamped at init; the WP4 forward-compat guard reads it
     "record": {"model": MODEL_DEFAULTS["record"], "input_max_chars": 60000, "subagent_cap": 30,
-               "max_assistant_chars": 1200, "max_user_chars": 1500},
+               "max_assistant_chars": 1200, "max_user_chars": 1500,
+               # Opt-in raw-source durability: gzip-copy each kept session's transcript into the
+               # untracked state/transcripts/ (Claude Code deletes the original after
+               # cleanupPeriodDays). Local only — never synced.
+               "archive_transcripts": False},
     "digest": {"recent_sessions": 12, "max_chars": 4000, "max_recent_lines": 20,
                "project_scope": False},
     # WP4 ROW 1 — reconcile (auto crash-gap catch-up in `maintain`): scan sessions newer than
@@ -3829,6 +3885,8 @@ def _record_sync_commit_push(old_page, page, slug, sid):
             tracked = git("ls-files", "--error-unmatch", old_page)
             if tracked.returncode == 0:                 # untracked old_page would fail the whole commit
                 paths.insert(0, old_page)
+        if (WIKI / "log.md").exists():
+            paths.append("log.md")                  # the op-log line for this record rides along
         git_commit_paths("record: %s %s" % (slug, sid[:8]), *paths)
         if cfg.get("auto_push", True):
             engine = str(Path(__file__).resolve())
