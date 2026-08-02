@@ -116,7 +116,9 @@ When `lint-report.md` has findings (surfaced in the digest + `wiki status`), the
    concrete fix recommendation.
 2. **Waits for the user's instruction.** It never batch-fixes or decides on the user's behalf.
 3. **Fixes only what the user directs** — verifying each flagged claim against its source journal (by
-   `sessionId`) first, then committing per fix.
+   `sessionId`) first, then committing per fix. When the journal line isn't enough,
+   `wiki transcript <sid8>` prints the underlying session's cleaned, redacted transcript
+   (`--raw` for the stored JSONL) — the deepest verification hop available.
 
 The report's **Suggested questions** section is not a findings list: the questions are prompts for
 the *user* to answer ("is thread X still real?"), never work items for the session to act on

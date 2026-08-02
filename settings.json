@@ -4,6 +4,7 @@
       "Bash(~/.claude/plugins/marketplaces/claude-wiki/bin/wiki query:*)",
       "Bash(~/.claude/plugins/marketplaces/claude-wiki/bin/wiki status:*)",
       "Bash(~/.claude/plugins/marketplaces/claude-wiki/bin/wiki doctor:*)",
+      "Bash(~/.claude/plugins/marketplaces/claude-wiki/bin/wiki transcript:*)",
       "Read(~/.claude/wiki/**)"
     ]
   }

@@ -14,6 +14,7 @@ User commands
     doctor  [--claude-contract]              dependency + data-repo health check
   Recall / status (daily):
     query   <terms> [--limit N] [--include-journal] [--include-archive] [--json]   FTS5 keyword search over pages
+    transcript <sid8> [--raw]                print an archived session transcript (cleaned; --raw = stored JSONL)
     status                                   ledger + schedule + health summary
   Maintenance (fold + health):
     ingest  [--limit N] | --accept | --reject | --if-due   fold journals → pages (risk/review-gated)
@@ -4937,6 +4938,62 @@ def _scrub_scan():
         _atomic_write(cache_fp, json.dumps(new_cache, separators=(",", ":")))
     return total, out
 
+def cmd_transcript(args):
+    """Read-only drill-down: print one session's transcript by sid8/prefix — the last hop of the
+    page → journal → transcript verification chain, one command instead of resolve/gunzip/eyeball.
+    Default = the cleaned rendering (the record step's own cleaner: header + readable body, secret-
+    redacted, head-and-tail bounded); --raw = the stored JSONL, still redacted line-by-line. The
+    redaction matters for the raw-store fallback, whose files are PRE-redaction — a Claude session
+    running this must never pull unredacted secrets into its context."""
+    raw = "--raw" in args
+    terms = [a for a in args if not a.startswith("--")]
+    if len(terms) != 1 or not re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]{3,35}", terms[0]):
+        print("usage: wiki transcript <sid8> [--raw]"); return 2
+    prefix = terms[0].lower()
+    cands, src_gz = sorted(glob.glob(str(WIKI / "transcripts" / (prefix + "*.jsonl.gz")))), True
+    if not cands:                          # fallback: Claude Code's raw store, inside its cleanup window
+        cands, src_gz = sorted(glob.glob(str(PROJECTS / "*" / (prefix + "*.jsonl")))), False
+    if not cands:
+        print("no transcript found for '%s' (synced tier or raw store)" % prefix); return 1
+    if len(cands) > 1:
+        print("ambiguous prefix '%s' — candidates:" % prefix)
+        for c in cands:
+            print("  " + os.path.basename(c))
+        return 2
+    import gzip
+    p = cands[0]
+    if raw:
+        opener = (lambda: gzip.open(p, "rt", errors="replace")) if src_gz else \
+                 (lambda: open(p, "r", errors="replace"))
+        with opener() as f:
+            for ln in f:
+                sys.stdout.write(_redact_secrets(ln[:1_000_000]))
+        return 0
+    if src_gz:                             # the cleaner takes a .jsonl path — inflate to a temp file
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix=".jsonl")
+        try:
+            with os.fdopen(fd, "wb") as t, gzip.open(p, "rb") as g:
+                for chunk in iter(lambda: g.read(1 << 20), b""):
+                    t.write(chunk)
+            header, cleaned, _ = clean_transcript(Path(tmp))
+        finally:
+            with contextlib.suppress(Exception):
+                os.unlink(tmp)
+    else:
+        header, cleaned, _ = clean_transcript(Path(p))
+    print("# %s" % (header.get("title") or os.path.basename(p)))
+    print("sid: %s · cwd: %s · branch: %s" % (header.get("sessionId") or prefix,
+                                              header.get("cwd") or "—", header.get("branch") or "—"))
+    print("span: %s → %s · models: %s" % (header.get("started") or "—", header.get("ended") or "—",
+                                          ", ".join(sorted(header.get("models") or [])) or "—"))
+    tools = ", ".join("%s×%d" % (k, v) for k, v in
+                      sorted(header.get("tool_counts", {}).items(), key=lambda kv: -kv[1])[:8])
+    print("tools: %s · files touched: %d · subagents: %d\n"
+          % (tools or "—", len(header.get("files_touched") or ()), header.get("subagents") or 0))
+    print(cleaned)
+    return 0
+
 def cmd_doctor(args):
     # WP4 ROW 2 — doctor hardening: exits NON-ZERO on a genuine failure (CI/automation can gate on it);
     # each external probe has a ~20s timeout; surfaces last-record success/error + a stale-capture note.
@@ -5095,6 +5152,7 @@ def main():
     if cmd == "maintain": return cmd_maintain(rest)
     if cmd == "backfill": return cmd_backfill(rest)
     if cmd == "query":    return cmd_query(rest)
+    if cmd == "transcript": return cmd_transcript(rest)
     if cmd == "doctor":   return cmd_doctor(rest)
     if cmd == "sync":     return cmd_sync(rest)
     if cmd == "init":     return cmd_init(rest)
