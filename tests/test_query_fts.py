@@ -20,8 +20,11 @@ paths = [h["path"] for h in json.loads(r.stdout)]
 assert any(p.endswith("dependency-injection.md") for p in paths), paths
 assert not any(p.endswith("seed.md") for p in paths), paths
 
-# a distinct keyword routes to a different doc (the journal entry)
-paths2 = [h["path"] for h in json.loads(run(["query", "pagination", "--json"], w).stdout)]
+# journal is OUT of the default scope (pages are the wiki's answers) …
+assert json.loads(run(["query", "pagination", "--json"], w).stdout) == []
+# … and opts in for drill-downs via --include-journal
+paths2 = [h["path"] for h in
+          json.loads(run(["query", "pagination", "--include-journal", "--json"], w).stdout)]
 assert any(p.endswith("sess.md") for p in paths2), paths2
 assert not any(p.endswith("dependency-injection.md") for p in paths2), paths2
 
@@ -30,9 +33,9 @@ assert not any(p.endswith("dependency-injection.md") for p in paths2), paths2
 paths3 = [h["path"] for h in json.loads(run(["query", "graph-root wire", "--json"], w).stdout)]
 assert any(p.endswith("dependency-injection.md") for p in paths3), paths3
 
-# a recorded recall term must NOT be searchable — else a re-run of a missed query "hits" the
-# entry that recorded the miss (self-referential match)
-assert json.loads(run(["query", "velvet armadillo", "--json"], w).stdout) == []
+# a recorded recall term must NOT be searchable even with the journal opted in — else a re-run
+# of a missed query "hits" the entry that recorded the miss (self-referential match)
+assert json.loads(run(["query", "velvet armadillo", "--include-journal", "--json"], w).stdout) == []
 
 # non-matching query → empty JSON …
 assert json.loads(run(["query", "zzzznonexistentterm", "--json"], w).stdout) == []

@@ -106,8 +106,10 @@ seed_ledger(w, [
 ])
 sh(w, "git", "add", "-A"); sh(w, "git", "commit", "-q", "-m", "seed journal")
 
-# sanity: before retention the old entry IS in the hot search index
-assert any(p.endswith("oldsess.md") for p in qpaths(w, TOK_OLD)), "old entry should be hot before maintain"
+# sanity: before retention the old entry IS in the hot search index (journal is search-reachable
+# only via the --include-journal opt-in; default query scope is pages-only)
+assert any(p.endswith("oldsess.md") for p in qpaths(w, TOK_OLD, "--include-journal")), \
+    "old entry should be hot before maintain"
 
 r = run(["maintain"], w)
 assert r.returncode == 0, r.stderr
@@ -122,9 +124,11 @@ assert (w / journal_rel(OLD, "pendold")).exists(), "an OLD but UN-ingested entry
 print("ok A: old ingested entry archived (moved, not deleted); recent + un-ingested stay hot")
 
 # --- B: hot path skips the archive; archive still reachable on explicit --include-archive ---
-assert not any("archive" in p for p in qpaths(w, TOK_OLD)), "archived entry must NOT surface in hot `wiki query`"
-assert qpaths(w, TOK_OLD) == [], "no hot hit at all for an archived-only token"
-assert any(p.endswith("recentsess.md") for p in qpaths(w, TOK_REC)), "a recent entry must still be searchable"
+assert not any("archive" in p for p in qpaths(w, TOK_OLD, "--include-journal")), \
+    "archived entry must NOT surface in hot `wiki query --include-journal`"
+assert qpaths(w, TOK_OLD, "--include-journal") == [], "no hot hit at all for an archived-only token"
+assert any(p.endswith("recentsess.md") for p in qpaths(w, TOK_REC, "--include-journal")), \
+    "a recent entry must still be searchable via --include-journal"
 inc = qpaths(w, TOK_OLD, "--include-archive")
 assert any(p == archived_rel(OLD, "oldsess") for p in inc), "--include-archive must still reach the archive: %r" % inc
 dg = run(["digest", "--cwd", str(w)], w).stdout

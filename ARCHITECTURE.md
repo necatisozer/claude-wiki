@@ -89,8 +89,11 @@ surfaces:
    not injected** — it is read on demand from `index.md`. Descriptions are inert-quoted (URLs,
    tool-call shapes, and imperatives defanged) — the digest is a *sandbox*, never a channel for
    instructions.
-2. **`wiki query "<terms>"`** — **FTS5 keyword search** over pages + journal, run via **Bash**
-   (the search is the one thing that needs code). `--include-archive` reaches archived entries.
+2. **`wiki query "<terms>"`** — **FTS5 keyword search** over pages, run via **Bash** (the search is
+   the one thing that needs code). Pages-only by default: the wiki's answers are its synthesized
+   pages, and short raw session notes otherwise beat long syntheses on BM25 length normalization.
+   `--include-journal` adds the hot journal for drill-downs; `--include-archive` reaches archived
+   entries (and implies the journal).
 3. **Claude's built-in `Read`** — open any page under the memory repo directly. Read is read-only, so
    it prompts on no path by default; the digest points, query finds, Read opens.
 

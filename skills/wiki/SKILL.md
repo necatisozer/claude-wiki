@@ -15,7 +15,8 @@ There is **no MCP server and no semantic/embedding search** — recall is three 
 1. **The SessionStart digest** (auto-injected): a small, bounded orientation — a static intro, the
    latest recents (∪ any un-ingested sessions), and the project names the memory covers. The full
    topic/project **map is not injected**; it is read on demand from `index.md`.
-2. **`wiki query "<terms>"`** — **FTS5 keyword search** over pages + journal, run via **Bash**. The
+2. **`wiki query "<terms>"`** — **FTS5 keyword search** over pages (`--include-journal` adds
+   per-session notes; `--include-archive` reaches archived entries), run via **Bash**. The
    plugin ships a scoped `Bash(...bin/wiki query:*)` allow-rule so this runs **prompt-free**. The
    digest surfaces it as `/wiki query "<terms>"`.
 3. **Claude's built-in Read** — open any page under the memory repo directly (also prompt-free via the
