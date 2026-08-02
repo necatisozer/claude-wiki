@@ -62,6 +62,14 @@ A one-way flow; each stage is bounded and gated.
 6. **`pages/`** — the durable wiki (topic + project pages), the browsable/queryable nodes.
 7. **`digest`** — injected at the next SessionStart (see Recall).
 
+**The raw-sources layer is ephemeral — the journal is the durable record.** Claude Code deletes
+session transcripts after `cleanupPeriodDays` (a Claude Code setting, not a wiki one), so a journal
+entry's `source:` path eventually dangles. After that, a page claim can only be verified against the
+journal entry itself — an LLM-written summary, not raw data. This is a deliberate trade (the wiki
+never copies transcripts: they are large, secret-bearing, and owned by Claude Code); `wiki doctor`
+reports how many source transcripts have already expired, and users who want a longer raw-data
+tail should raise `cleanupPeriodDays` in their Claude Code `settings.json`.
+
 Scheduling is **cron-based** and **hook-triggered**: `maintain` (detached, run from SessionStart) does
 crash-gap **reconcile**, due-based ingest (daily) and lint (weekly), and journal retention, all under
 one lock. A job is "due" when its cron has fired since it last ran, so a missed occurrence is caught up

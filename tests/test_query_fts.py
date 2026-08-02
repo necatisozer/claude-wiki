@@ -9,7 +9,9 @@ w = make_wiki()   # seeds pages/topics/seed.md ("seed page")
 (w / "pages" / "topics" / "dependency-injection.md").write_text(
     "---\nname: Dependency Injection\n---\nHilt and Koin wire dependencies at the graph root.\n")
 (w / "journal" / "2026" / "07" / "sess.md").write_text(
-    "---\nname: Session notes\nsessionId: s1\n---\nDebugged a flaky pagination cursor today.\n")
+    "---\nname: Session notes\nsessionId: s1\n"
+    'recall: [{"q":"velvet armadillo","hit":false}]\n'
+    "---\nDebugged a flaky pagination cursor today.\n")
 
 # keyword hit → the DI page (not the seed page, not the journal entry)
 r = run(["query", "dependencies", "--json"], w)
@@ -27,6 +29,10 @@ assert not any(p.endswith("dependency-injection.md") for p in paths2), paths2
 # "graph-root wire" appears nowhere verbatim, but every word is on the DI page
 paths3 = [h["path"] for h in json.loads(run(["query", "graph-root wire", "--json"], w).stdout)]
 assert any(p.endswith("dependency-injection.md") for p in paths3), paths3
+
+# a recorded recall term must NOT be searchable — else a re-run of a missed query "hits" the
+# entry that recorded the miss (self-referential match)
+assert json.loads(run(["query", "velvet armadillo", "--json"], w).stdout) == []
 
 # non-matching query → empty JSON …
 assert json.loads(run(["query", "zzzznonexistentterm", "--json"], w).stdout) == []

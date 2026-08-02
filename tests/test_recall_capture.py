@@ -73,6 +73,7 @@ header, cleaned, stats = clean([
     tu("t5", "Bash", {"command": "wiki query interrupted never answered"}),
     tu("t6", "Bash", {"command": 'wiki query "<terms>"'}),          # digest suggestion text — not a search
     tu("t7", "Bash", {"command": "git status"}),                     # not a wiki query at all
+    tu("t8", "Bash", {"command": 'wiki query "storekit trial" --limit 8 2>&1 | head -1'}),
 ])
 r = header["recall"]
 assert r[0] == {"q": "metro di", "hit": False}, "confirmed miss must pair: %r" % r
@@ -80,8 +81,10 @@ assert r[1] == {"q": "kmp publishing", "hit": True}, "confirmed hit must pair: %
 assert r[2] == {"q": "nothing", "hit": False}, "--json '[]' is a confirmed miss: %r" % r
 assert r[3] == {"q": "broken", "hit": None}, "an errored result stays unknown: %r" % r
 assert r[4] == {"q": "interrupted never answered", "hit": None}, "unpaired stays unknown: %r" % r
-assert len(r) == 5, "placeholder + non-query commands must not capture: %r" % r
-print("ok 1: query capture with paired hit/miss; placeholder, flags, non-queries ignored")
+assert r[5]["q"] == "storekit trial", \
+    "pipeline tail + --limit value are plumbing, not term words: %r" % r[5]
+assert len(r) == 6, "placeholder + non-query commands must not capture: %r" % r
+print("ok 1: query capture with paired hit/miss; placeholder, flags, plumbing, non-queries ignored")
 
 # =============================================================================================
 # 2. Sanitizer: Turkish folds not mangles; whitelist strips shell/injection shapes; hyphen runs

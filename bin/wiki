@@ -485,20 +485,50 @@ def _sanitize_recall_term(s):
     s = re.sub(r"\s+", " ", s).strip()
     return s[:60]
 
+def _shell_prefix(cmd):
+    """The command text before the first unquoted shell operator (| ; & < >) — a pipeline tail or
+    redirect (`2>&1 | head -1`) is shell plumbing, not part of a search term. Operators inside
+    quotes are query text and survive. Returns (prefix, truncated?)."""
+    out, quote = [], ""
+    for c in cmd:
+        if quote:
+            out.append(c)
+            if c == quote:
+                quote = ""
+        elif c in "'\"":
+            quote = c
+            out.append(c)
+        elif c in "|;&<>":
+            return "".join(out), True
+        else:
+            out.append(c)
+    return "".join(out), False
+
 def _recall_query_term(cmd):
     """The sanitized search term of a `wiki … query …` Bash command, or None when the command isn't
-    a wiki query. Flag tokens (`--json`, `--limit 5`) are dropped; the digest's own literal
-    `<terms>` placeholder is ignored (it's the suggestion text, not a search)."""
+    a wiki query. Flag tokens (`--json`) and `--limit`'s value are dropped; anything after an
+    unquoted shell operator is plumbing, not the term; the digest's own literal `<terms>`
+    placeholder is ignored (it's the suggestion text, not a search)."""
     cmd = str(cmd or "")
     if "query" not in cmd or "wiki" not in cmd or "<terms>" in cmd:
         return None
+    cmd, truncated = _shell_prefix(cmd)
     try:
         toks = shlex.split(cmd)
     except Exception:
         return None
     for i, t in enumerate(toks):
         if t == "query" and i > 0 and os.path.basename(toks[i - 1]).lower() == "wiki":
-            words = [w for w in toks[i + 1:] if not w.startswith("-")]
+            words, skip = [], False
+            for w in toks[i + 1:]:
+                if skip:
+                    skip = False
+                elif w == "--limit":
+                    skip = True          # the flag's numeric value is not a search word
+                elif not w.startswith("-"):
+                    words.append(w)
+            if truncated and words and words[-1].isdigit():
+                words.pop()              # fd prefix of a redirect ("2>&1") — plumbing, not a term
             return _sanitize_recall_term(" ".join(words)) or None
     return None
 
@@ -3124,6 +3154,18 @@ def _doc_kind(rel):
     if rel.startswith("journal/"):        return "journal"
     return "other"
 
+def _strip_recall_line(txt):
+    """Drop the `recall:` frontmatter line from a doc before FTS indexing. Recall capture stores
+    past *query terms* in journal frontmatter; indexing them makes a re-run of a missed query
+    "hit" the very entry that recorded the miss — a self-referential match that buries real
+    results. Frontmatter block only; body text is never touched."""
+    if not txt.startswith("---"):
+        return txt
+    end = txt.find("\n---", 3)
+    if end < 0:
+        return txt
+    return re.sub(r"(?m)^recall:[^\n]*$", "", txt[:end]) + txt[end:]
+
 def keyword_search(q, limit=10, include_archive=False):
     """FTS5 keyword retrieval over pages + journal. Relevance-first; kind only breaks ties. The S3
     retention archive (journal/archive/) is OUT of the hot path — skipped unless include_archive is
@@ -3136,7 +3178,8 @@ def keyword_search(q, limit=10, include_archive=False):
                 continue                              # retention archive — out of the hot search path
             txt = _read_capped(p, errors="replace")   # bounded FTS insert — an oversized page can't OOM query
             db.execute("INSERT INTO docs VALUES(?,?,?)",
-                       (os.path.relpath(p, WIKI), parse_frontmatter(txt).get("name", ""), txt))
+                       (os.path.relpath(p, WIKI), parse_frontmatter(txt).get("name", ""),
+                        _strip_recall_line(txt)))
     snip = "snippet(docs, 2, '»', '«', '…', 14)"
     def run(match):
         return db.execute(
@@ -4726,6 +4769,20 @@ def _doctor_record_health():
         conn.close()
     return last_ok, int(n_err or 0), last_err
 
+def _dangling_sources():
+    """(total, dangling) over the hot journal's `source:` transcript paths. Claude Code deletes
+    session transcripts after `cleanupPeriodDays`, so old paths dangle silently — after that,
+    verification bottoms out at the journal entry itself, not raw data. Doctor makes that
+    erosion visible; it is expected wear, not breakage."""
+    tot = gone = 0
+    for p in glob.glob(str(WIKI / "journal" / "**" / "*.md"), recursive=True):
+        src = parse_frontmatter(_read_capped(p, errors="replace")).get("source", "")
+        if src.endswith(".jsonl"):
+            tot += 1
+            if not os.path.exists(src):
+                gone += 1
+    return tot, gone
+
 def cmd_doctor(args):
     # WP4 ROW 2 — doctor hardening: exits NON-ZERO on a genuine failure (CI/automation can gate on it);
     # each external probe has a ~20s timeout; surfaces last-record success/error + a stale-capture note.
@@ -4843,6 +4900,13 @@ def cmd_doctor(args):
         line("drift", False, "unknown transcript entry type(s): %s — Claude Code format may have changed" % top)
     else:
         line("drift", True, "no unknown transcript entry types")
+    # Source-transcript expiry (advisory): Claude Code's cleanupPeriodDays deletes old session
+    # transcripts, after which a journal claim can only be verified against the journal itself.
+    tot, gone = _dangling_sources()
+    line("sources", gone == 0,
+         "all %d journal source transcript(s) still on disk" % tot if gone == 0 else
+         "%d/%d journal source transcript(s) already deleted by Claude Code's cleanupPeriodDays — "
+         "raise it in settings.json to keep raw transcripts longer" % (gone, tot))
     return 1 if fails[0] else 0
 
 def main():
