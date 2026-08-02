@@ -23,6 +23,11 @@ paths2 = [h["path"] for h in json.loads(run(["query", "pagination", "--json"], w
 assert any(p.endswith("sess.md") for p in paths2), paths2
 assert not any(p.endswith("dependency-injection.md") for p in paths2), paths2
 
+# hyphenated term (FTS5 bareword syntax error) → tokenized-AND retry, not exact-phrase-only:
+# "graph-root wire" appears nowhere verbatim, but every word is on the DI page
+paths3 = [h["path"] for h in json.loads(run(["query", "graph-root wire", "--json"], w).stdout)]
+assert any(p.endswith("dependency-injection.md") for p in paths3), paths3
+
 # non-matching query → empty JSON …
 assert json.loads(run(["query", "zzzznonexistentterm", "--json"], w).stdout) == []
 

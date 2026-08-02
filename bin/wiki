@@ -3145,7 +3145,15 @@ def keyword_search(q, limit=10, include_archive=False):
     try:
         rows = run(q)
     except sqlite3.OperationalError:
-        rows = run('"%s"' % q.replace('"', " "))
+        # Hyphenated terms (e.g. "ad-hoc") are FTS5 bareword syntax errors, and the whole-string
+        # phrase fallback only matches text containing the query verbatim — so one hyphen used to
+        # silently degrade the whole query to an exact-phrase match (a recall-miss class). Retry
+        # with each word individually quoted (always a literal term, implicit AND) first.
+        terms = re.findall(r"[A-Za-z0-9_]+", q)
+        try:
+            rows = run(" ".join('"%s"' % t for t in terms)) if terms else []
+        except sqlite3.OperationalError:
+            rows = run('"%s"' % q.replace('"', " "))
     kindrank = {"project": 0, "topic": 0, "journal": 1, "other": 2}
     out = [{"path": p, "title": t or "", "snippet": " ".join(sn.split()),
             "score": rank, "kind": _doc_kind(p)} for (p, t, sn, rank) in rows]
