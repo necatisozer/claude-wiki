@@ -2522,6 +2522,10 @@ def cmd_lint(args):
         return lint_if_due(cfg)
     rep = run_lint(cfg)        # manual: run the sweep now
     if rep:
+        write_last_lint()      # a manual sweep IS the latest lint: stamp it so `status` reports the
+                               # real date and the weekly cron doesn't re-run what just ran. Stamped
+                               # after the sweep (not before, as the cron path does) because there is
+                               # no duplicate-run window to guard here — only a completed sweep counts.
         print(rep)
     return 0
 

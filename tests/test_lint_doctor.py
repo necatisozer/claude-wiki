@@ -215,8 +215,16 @@ assert r.returncode == 0, r.stdout + r.stderr
 n = int((W2 / "state" / "lint_open").read_text().strip())
 assert n == 2, "lint_open must equal the count of LLM [high] findings (2) on a structurally clean wiki, got %d" % n
 
+# A MANUAL sweep must stamp state/last_lint too. Only the `--if-due` cron path used to stamp it, so
+# `status` kept reporting a stale date and the weekly cron re-ran a sweep that had just completed.
+ll = W2 / "state" / "last_lint"
+assert ll.exists() and ll.read_text().strip(), "a manual `wiki lint` must stamp state/last_lint"
+
 rs = run(["status"], W2)
 assert rs.returncode == 0, rs.stderr
+lastline = [l for l in rs.stdout.splitlines() if "last lint" in l]
+assert lastline and "—" not in lastline[0], \
+    "`wiki status` must report the manual sweep's date, not a placeholder:\n" + rs.stdout
 sline = [l for l in rs.stdout.splitlines() if "open lint finding" in l]
 assert sline, "`wiki status` must carry the lint banner:\n" + rs.stdout
 assert "2" in sline[0], "the status lint banner must carry the count"
