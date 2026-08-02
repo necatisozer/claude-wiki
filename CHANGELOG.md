@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.14] - 2026-08-02
+
+### Fixed
+
+- **A manual `wiki lint` now stamps `state/last_lint`.** Only the `--if-due`
+  cron path wrote the timestamp, so running `wiki lint` by hand refreshed
+  `lint-report.md` and `state/lint_open` but left `last_lint` at whatever the
+  last scheduled sweep set. Two consequences: `wiki status` kept reporting a
+  stale "last lint" date long after a fresh sweep, and the weekly cron still
+  considered lint due, re-running a full-corpus LLM sweep that had just
+  completed. The manual path now stamps *after* `run_lint` returns a report —
+  the cron path deliberately stamps first, to close a duplicate-run window that
+  a manual invocation does not have, so only a completed sweep counts.
+
 ## [0.1.13] - 2026-07-20
 
 ### Added
