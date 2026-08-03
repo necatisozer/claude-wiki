@@ -5,6 +5,79 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.16] - 2026-08-03
+
+The gist-alignment release: a live divergence hunt against the running system
+(not the code alone) found four gaps between the engine and its own design
+intent — all closed here, plus the tooling that fell out of closing them.
+
+### Added
+
+- **Cross-device transcript durability (`record.sync_transcripts`, default off).**
+  Claude Code deletes raw session transcripts on its `cleanupPeriodDays` timer,
+  after which a page claim could only be verified against the journal entry —
+  an LLM-written summary, not raw data. Each kept session's transcript is now
+  written as a secret-REDACTED gzip at `transcripts/<sid>.jsonl.gz`, a tracked
+  file committed and pushed with the record: same trust class as the journal
+  (nothing lands unredacted; redaction runs line-by-line before compression,
+  since the pre-push scanner cannot see inside a .gz). Files ≥95 MB are
+  skipped; failures never fail a record. A raw local tier
+  (`record.archive_transcripts`, gzip into untracked `state/transcripts/`) is
+  also available for byte-faithful local retention.
+- **`wiki transcript <sid8> [--raw]`** — the last hop of the
+  page → journal → transcript verification chain in one read-only command:
+  prints the cleaned, redacted rendering (header + readable body) of the
+  session an sid8 cites, `--raw` for the stored JSONL. Falls back to Claude
+  Code's raw store inside its cleanup window, redacting on output. Ships with
+  a fifth scoped allow-rule.
+- **Durable operations log (`log.md`).** One engine-written, unix-parseable
+  line per record / ingest / lint / retention pass, append-only, committed
+  with the operation that wrote it — the gist's `log.md`, previously split
+  across the ledger (machine-only sqlite) and a rotating debug log.
+- **Doctor: `sources` and `scrub` checks.** `sources` counts journal `source:`
+  transcripts already deleted by `cleanupPeriodDays` (the erosion was
+  invisible; on the author's machine 339/399 were already gone). `scrub`
+  re-scans the synced transcript tier with the *current* secret patterns —
+  masks are idempotent, so any hit is content the upload-day patterns missed —
+  cached per (file sha256, engine version); findings name sid8 + pattern class
+  only, never matched text.
+- **Lint suggests questions (report-only).** The weekly report now ends with a
+  `## Suggested questions` section: at most 5 questions for the human — long-
+  untouched active threads, follow-ups recurring without an outcome,
+  unresolved contradicted pages. No severity tags, never counted as findings,
+  never proposed edits: "lint detects, humans decide" stands.
+- **Obsidian as the reading surface (docs + gitignore).** `pages/` is already
+  a valid Obsidian vault; README documents the zero-config path, and the
+  required gitignore now covers `.obsidian/` and `.trash/` at any depth so
+  vault state never enters the synced repo. Deliberately no `wiki obsidian`
+  command.
+
+### Changed
+
+- **`wiki query` is pages-only by default.** BM25 length normalization let
+  short raw journal entries outrank the long synthesized pages they were
+  folded into — measured live: a broad query ranked five session notes above
+  the first page. The wiki's answers are its pages; `--include-journal` opts
+  session notes back in for drill-downs, and `--include-archive` implies it.
+- **`CLAUDE_CONFIG_DIR` honored.** The transcript store, default data dir, and
+  plugin marketplace/cache paths all derive from one `CLAUDE_DIR` (Claude
+  Code's relocation knob, stock `~/.claude` fallback); the SessionEnd shim
+  follows the same rule. `WIKI_HOME` still wins for the data dir.
+
+### Fixed
+
+- **Recall capture no longer poisons itself.** Captured miss-query terms were
+  stored in journal frontmatter *and* FTS-indexed, so re-running a missed
+  query "hit" the very entry that recorded the miss; capture also swallowed
+  shell plumbing (`2>&1 | head -1` became "2 1 head") and `--limit`'s value.
+  The `recall:` line is now stripped from the FTS body, and term extraction
+  truncates at the first unquoted shell operator and skips flag values.
+- **A hyphenated search term no longer silently degrades the whole query.**
+  `ad-hoc` or `music-ai` is an FTS5 bareword syntax error, and the old
+  fallback matched only the query as an exact phrase. On syntax error the
+  query now retries with each word individually quoted (literal terms,
+  implicit AND) before the phrase fallback.
+
 ## [0.1.15] - 2026-08-02
 
 ### Fixed

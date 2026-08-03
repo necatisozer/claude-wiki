@@ -14,7 +14,7 @@ run it on.
 
 ```
 gh auth login
-curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.15/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.16/install.sh | bash
 ```
 
 This installs the plugin, verifies the install actually took, and runs `wiki init` to set up your
@@ -26,7 +26,7 @@ it never falls back to anyone else's namespace. To restore from or create a spec
 it after `--`:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.15/install.sh | bash -s -- owner/repo
+curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.16/install.sh | bash -s -- owner/repo
 ```
 
 The piped one-liner always passes `--yes`, because a script arriving over a pipe has no terminal
@@ -34,7 +34,7 @@ attached for interactive confirmation prompts. Security-conscious users can insp
 it with a real stdin instead of piping it (the piped form cannot self-verify its own checksum):
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.15/install.sh
+curl -fsSLO https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.16/install.sh
 bash install.sh
 ```
 
@@ -117,12 +117,12 @@ workspace files and `.trash/` at any depth, so vault state never enters the sync
 are fine — you are the curator, and ingest commits only its own exact paths — but avoid editing
 while a scheduled ingest is running.
 
-## Permission setup (recommended — copy 4 rules)
+## Permission setup (recommended — copy 5 rules)
 
 For the recall surfaces to run **prompt-free**, Claude needs read-only auto-allow for the wiki's read
-commands. The plugin ships these four scoped rules in [`settings.json`](settings.json), but **Claude
+commands. The plugin ships these five scoped rules in [`settings.json`](settings.json), but **Claude
 Code does not yet auto-grant permissions from a plugin** — a plugin-shipped `permissions` block is
-currently inert. Until the platform honors it, copy the four rules into your **own**
+currently inert. Until the platform honors it, copy the five rules into your **own**
 `~/.claude/settings.json`:
 
 ```json
@@ -132,13 +132,15 @@ currently inert. Until the platform honors it, copy the four rules into your **o
       "Bash(~/.claude/plugins/marketplaces/claude-wiki/bin/wiki query:*)",
       "Bash(~/.claude/plugins/marketplaces/claude-wiki/bin/wiki status:*)",
       "Bash(~/.claude/plugins/marketplaces/claude-wiki/bin/wiki doctor:*)",
+      "Bash(~/.claude/plugins/marketplaces/claude-wiki/bin/wiki transcript:*)",
       "Read(~/.claude/wiki/**)"
     ]
   }
 }
 ```
 
-These are **read-only**: keyword search, status, health check, and reading your own memory. Everything
+These are **read-only**: keyword search, status, health check, transcript drill-down, and reading
+your own memory. Everything
 that mutates (ingest/sync/init) still prompts. Skip this and the wiki still works — you'll just get a
 permission prompt the first time each read command runs.
 
