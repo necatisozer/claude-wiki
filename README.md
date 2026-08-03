@@ -71,8 +71,8 @@ That boundary is the publish line: code is public, memory is private. Additional
 The engine calls the Claude API on your account. Rough governors:
 
 - **record** runs on **haiku**, once per finished session.
-- **ingest** runs on **sonnet**, folding only the ~10 **selected** page bodies (a two-phase, index-first
-  design — not the whole corpus) plus the new journal entries; daily by default.
+- **ingest** runs on **sonnet**, folding only the (≤ 12 by default) **selected** page bodies (a
+  two-phase, index-first design — not the whole corpus) plus the new journal entries; daily by default.
 - **lint** runs on **sonnet**, weekly.
 
 Ballpark **~$2–5/month** of API usage at moderate activity, **scaling with your volume and page count**
@@ -93,8 +93,9 @@ Each session flows through a one-way pipeline; recall is a separate, pull-based 
    redacts secrets)     entry)     gate: junk→skip,   entries)      sonnet:      project
                                    leak/inject/secret               ① select     pages)
                                    →fail-closed)                    ② fold)
-                                                                        │
-  SessionStart hook ◀── digest injection ◀───────── index.md ◀─────────┘
+                                                                        └──▶ index.md (routing map)
+
+  SessionStart hook ◀── digest injection (ledger recents + project-page orientation)
 
   Recall  =  digest (bounded recents + orientation, map on demand)
            +  wiki query   (FTS5 keyword search, run via Bash)

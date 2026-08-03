@@ -1,8 +1,17 @@
 # tests/sync_util.py — shared harness: throwaway WIKI_HOME git repos + a local bare "origin".
-import os, subprocess, sys, tempfile
+import atexit, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent      # tests/ lives at <repo>/tests/
 ENGINE = str(ROOT / "bin" / "wiki")
+
+_TMPDIRS = []
+@atexit.register
+def _cleanup_tmpdirs():
+    for d in _TMPDIRS:
+        shutil.rmtree(d, ignore_errors=True)
+
+def _mkdtemp(prefix):
+    d = tempfile.mkdtemp(prefix=prefix); _TMPDIRS.append(d); return d
 
 def sh(cwd, *args, input=None):
     return subprocess.run(list(args), cwd=cwd, capture_output=True, text=True, input=input)
@@ -14,8 +23,8 @@ def must(r, msg="setup command failed"):
 
 def make_wiki(branch="main"):
     """Throwaway data repo: git init + identity + minimal wiki layout + one seed commit."""
-    d = Path(tempfile.mkdtemp(prefix="wiki5_"))
-    sh(d, "git", "init", "-q", "-b", branch)
+    d = Path(_mkdtemp("wiki5_"))
+    must(sh(d, "git", "init", "-q", "-b", branch), "git init -b (needs git ≥ 2.28)")
     sh(d, "git", "config", "user.email", "t@t")
     sh(d, "git", "config", "user.name", "t")
     (d / "pages" / "topics").mkdir(parents=True)
@@ -33,13 +42,14 @@ def make_origin(branch="main"):
     # -b main is REQUIRED: a default `git init --bare` leaves HEAD → refs/heads/master (this
     # machine has no init.defaultBranch), so clones of a main-only bare check out an EMPTY
     # worktree and every subsequent seed push fails silently.
-    b = Path(tempfile.mkdtemp(prefix="origin5_")) / "remote.git"
-    subprocess.run(["git", "init", "-q", "--bare", "-b", branch, str(b)])
+    b = Path(_mkdtemp("origin5_")) / "remote.git"
+    must(subprocess.run(["git", "init", "-q", "--bare", "-b", branch, str(b)],
+                        capture_output=True, text=True), "bare git init -b")
     return b
 
 def seed_origin(origin, files, branch="main"):
     """Populate a bare origin: temp clone → write files → push. Returns the temp worktree."""
-    d = Path(tempfile.mkdtemp(prefix="seed5_")) / "w"
+    d = Path(_mkdtemp("seed5_")) / "w"
     must(subprocess.run(["git", "clone", "-q", str(origin), str(d)],
                         capture_output=True, text=True), "clone for seeding")
     sh(d, "git", "config", "user.email", "t@t"); sh(d, "git", "config", "user.name", "t")

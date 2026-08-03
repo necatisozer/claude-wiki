@@ -16,11 +16,13 @@ There is **no MCP server and no semantic/embedding search** — recall is three 
    latest recents (∪ any un-ingested sessions), and the project names the memory covers. The full
    topic/project **map is not injected**; it is read on demand from `index.md`.
 2. **`wiki query "<terms>"`** — **FTS5 keyword search** over pages (`--include-journal` adds
-   per-session notes; `--include-archive` reaches archived entries), run via **Bash**. The
-   plugin ships a scoped `Bash(...bin/wiki query:*)` allow-rule so this runs **prompt-free**. The
-   digest surfaces it as `/wiki query "<terms>"`.
-3. **Claude's built-in Read** — open any page under the memory repo directly (also prompt-free via the
-   shipped `Read(~/.claude/wiki/**)` grant). Awareness lives in the digest; depth lives in query + Read.
+   per-session notes; `--include-archive` reaches archived entries), run via **Bash**. The plugin
+   ships a scoped `Bash(...bin/wiki query:*)` allow-rule, but Claude Code treats plugin-shipped
+   permissions as **inert** — recall runs prompt-free only after the user copies the five-rule
+   block into `~/.claude/settings.json` (see README → Permissions). The digest surfaces it as
+   `/wiki query "<terms>"`.
+3. **Claude's built-in Read** — open any page under the memory repo directly (prompt-free under the
+   same copied `Read(~/.claude/wiki/**)` rule). Awareness lives in the digest; depth in query + Read.
 
 ## Code vs data (two roots)
 - **Code** = the plugin (engine `bin/wiki`, `prompts/`, `SCHEMA.md`, the `hooks/` + `commands/`
@@ -35,7 +37,9 @@ There is **no MCP server and no semantic/embedding search** — recall is three 
 - `pages/topics/`, `pages/projects/` — the **durable wiki** (browsable, queryable nodes).
 - `journal/` — transient per-session summaries (**fuel**; folded into pages by ingest, never nodes).
   Old ingested entries are archived (never deleted) under `journal/archive/YYYY/MM`.
-- `index.md` — auto-generated catalog of pages · `lint-report.md` — latest sweep findings.
+- `index.md` — auto-generated catalog of pages · `lint-report.md` — latest sweep findings ·
+  `log.md` — append-only operations log (one line per record/ingest/lint/retention pass) ·
+  `transcripts/` — opt-in redacted transcript copies (`record.sync_transcripts`).
 - `config.json` — settings (models, crons, caps); per-device overrides in untracked
   `state/config.local.json` (holds the `sync` block). `SCHEMA.md` (data-repo copy) — author residue, not read.
 - `state/` — local, rebuildable (ledger, locks, run-stamps, `push_blocked`/`drift.json`); gitignored ·
@@ -47,7 +51,8 @@ Everything under **Commands** is the *manual* surface — you rarely need it.
 
 ## Commands
 Run in a session via the **`/wiki:wiki <cmd>`** command, or call the engine directly:
-`python3 ~/.claude/plugins/marketplaces/claude-wiki/bin/wiki <cmd>`. Written `wiki <cmd>` below.
+`~/.claude/plugins/marketplaces/claude-wiki/bin/wiki <cmd>` (no `python3` prefix — the prefixed
+form would not match the copied allow-rules and prompts every time). Written `wiki <cmd>` below.
 
 **Setup / sync (per machine)**
 - `wiki init [owner/repo | git-url] [--yes]` — one command, any machine state → this device synced.
@@ -65,8 +70,9 @@ Run in a session via the **`/wiki:wiki <cmd>`** command, or call the engine dire
   probes the live `claude -p` envelope.
 
 **Recall / status (daily)**
-- `wiki query <terms> [--limit N] [--include-archive] [--json]` — FTS5 keyword search across pages +
-  journal. `--include-archive` also searches archived journal entries.
+- `wiki query <terms> [--limit N] [--include-journal] [--include-archive] [--json]` — FTS5 keyword
+  search across **pages** (pages-only by default; `--include-journal` adds per-session journal
+  notes, `--include-archive` also reaches archived entries).
 - `wiki status` — enabled state, schedules (flags an `⚠ INVALID CRON`), journal count, lint state,
   sync state, recent sessions.
 
@@ -133,8 +139,12 @@ Never build or enable an autonomous `wiki lint --fix` path without explicit appr
 ## Resolving a held ingest (hard contradiction)
 When auto-ingest hits a **hard** contradiction (or the risk gate trips) it HOLDS: stages the batch
 uncommitted, sets a flag, blocks further auto-ingest, and surfaces a banner in the digest + `wiki status`.
-1. **Inspect** the staged pages: `git -C ~/.claude/wiki diff` (the model wrote both claims with a
-   `⚠️ CONTRADICTION` note); `cat ~/.claude/wiki/state/ingest_held` shows the conflict if present.
+1. **Inspect** the staged pages: `git -C ~/.claude/wiki status --short` first (brand-new staged
+   pages are *untracked* — plain `diff` misses them), then `git -C ~/.claude/wiki diff`
+   (the model wrote both claims with a `⚠️ CONTRADICTION` note);
+   `cat ~/.claude/wiki/state/ingest_held` shows the hold reason. If the reason names refused
+   blocks, their content is preserved at `state/ingest-refused.md` — hand-merge what's worth
+   keeping before accepting.
 2. **Resolve:** edit the flagged page to settle it (usually newest-wins — your call), remove the `⚠️`
    line, set `status: active`.
 3. **Clear:** `wiki ingest --accept` (commits + resumes auto-ingest) or `--reject` (discards; the
@@ -162,4 +172,4 @@ Uninstalling is three explicit manual steps, by design (no teardown command that
    `git -C ~/.claude/wiki config --unset core.hooksPath` (skip if unset).
 3. **Optional and explicit:** delete the memory itself — `rm -rf ~/.claude/wiki` (local) and delete
    the private GitHub repo. Your memory is a normal private repo; nothing else deletes it for you.
-Also drop the four wiki allow-rules from your `~/.claude/settings.json` if you copied them in.
+Also drop the five wiki allow-rules from your `~/.claude/settings.json` if you copied them in.

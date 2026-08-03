@@ -245,6 +245,9 @@ result_file.write_text(
     "    print(json.dumps({'result': '=== SELECTED PAGES ===\\n=== END ===', "
     "'total_cost_usd': 0.0, 'is_error': False}))\n"
     "else:\n"
+    "    tf = os.environ.get('FAKE_TOUCH_FILE')\n"
+    "    if tf:\n"       # simulate a SessionEnd re-record landing DURING the fold's LLM call
+    "        open(tf, 'a').write('\\nresumed-session content the fold never saw\\n')\n"
     "    print(json.dumps({'result': open(os.environ['FAKE_CLAUDE_RESULT_FILE']).read(), "
     "'total_cost_usd': 0.0, 'is_error': False}))\n")
 os.chmod(fake / "claude", 0o755)
@@ -373,5 +376,40 @@ assert r.returncode == 0, r.stdout + r.stderr
 assert "ONLY-REFUSED-CONTENT" in (we2 / "state" / "ingest-refused.md").read_text(), \
     "a blocked auto-run must leave the stash untouched"
 print("ok 4e: refused-only manual batch HOLDs; pending gate keeps cron off the stash")
+
+# =============================================================================================
+# 4f. INGEST/RECORD RACE — a journal entry REWRITTEN while the fold's LLM call runs (a resumed
+#     session's SessionEnd record) must NOT be marked ingested: its new content never reached
+#     any page. The batch still commits; the rewritten entry stays queued for the next fold.
+# =============================================================================================
+wf = _fresh("rg4f_", git=True)
+_commit_all(wf, "seed")
+SID_F = "deadbeef-4d4d-4006-9abc-000000000006"
+jrel_f = "journal/2026/07/entry-f.md"
+_seed_e2e(wf, SID_F, jrel_f, "Session F", "gateway work")
+result_file_f = fake / "ing_out_f.md"
+result_file_f.write_text(
+    "=== FILE: pages/topics/gateway.md ===\n"
+    "---\nname: Gateway\ndescription: gateway notes\ntype: topic\nslug: gateway\n"
+    "created: 2026-07-06\nupdated: 2026-07-06\nstatus: active\n---\n"
+    "# Gateway\n\n" + BENIGN + "\n\n"
+    "## Sources\n- 2026-07-06 · deadbeef · session f\n"
+    "=== END ===\n=== SUMMARY ===\ncreated: gateway\nhard_contradiction: none\n")
+env_f = {**env, "WIKI_HOME": str(wf), "FAKE_CLAUDE_RESULT_FILE": str(result_file_f),
+         "FAKE_TOUCH_FILE": str(wf / jrel_f)}
+r = subprocess.run([sys.executable, str(ENGINE), "ingest", "--if-due"], capture_output=True, text=True, env=env_f)
+assert r.returncode == 0, r.stdout + r.stderr
+show = subprocess.run(["git", "-C", str(wf), "show", "HEAD:pages/topics/gateway.md"],
+                      capture_output=True, text=True)
+assert show.returncode == 0, "the fold's page must still commit (old content is valid)"
+jf = (wf / jrel_f).read_text()
+assert "ingested: false" in jf, \
+    "an entry rewritten mid-fold must stay un-ingested (its new content reached no page):\n" + jf
+assert "resumed-session content the fold never saw" in jf, "sanity: the mid-fold rewrite happened"
+db = sqlite3.connect(str(wf / "state" / "ledger.db"))
+ing_f = db.execute("SELECT ingested_at FROM sessions WHERE session_id=?", (SID_F,)).fetchone()[0]
+db.close()
+assert ing_f is None, "ledger must not stamp a mid-fold-rewritten session: %r" % ing_f
+print("ok 4f: journal rewritten mid-fold stays un-ingested (race guard) while the batch commits")
 
 print("PASS test_risk_gate")

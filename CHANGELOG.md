@@ -52,6 +52,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact-version gate hard-fails against the current marketplace; both now track
   the current release, and CONTRIBUTING.md documents the release-time sweep of
   every pinned URL.
+- **Ingest/record race guard.** A journal entry rewritten while the fold's LLM
+  call ran (a resumed session's SessionEnd record) was marked `ingested` even
+  though its new content never reached any page. The auto batch now snapshots
+  each entry's mtime before reading and leaves mid-fold-rewritten entries
+  un-ingested for the next fold.
+- **Smaller ledger/sync/scan fixes.** A session recorded before its project was
+  added to `projects.exclude` keeps its ledger row on re-record (UPDATE-in-place,
+  not INSERT OR REPLACE); `wiki reindex` seeds `last_mtime`/`transcript_path`
+  from the on-disk transcript so a rebuilt ledger no longer re-records (and
+  re-bills) every session; `_sync_pull` reads its pre-pull HEAD inside the
+  git-write lock; the ingest write guard rejects nested `pages/<kind>/a/b.md`
+  paths (writable-but-invisible to lint/index); the generated pre-push hook
+  shell-quotes device paths; the push-scan runs with `core.quotePath=false` so
+  binary findings on non-ASCII filenames stay attributed; the lint `[high]`
+  count excludes the confirm/dismiss echo (double-counted deterministic
+  findings).
+- **Prompt/contract alignment.** The record prompt's first-line cap now matches
+  the code/SCHEMA at 120 chars; the phase-1 select prompt's page cap is
+  substituted from `ingest.max_selected_pages` (`{{MAX_SELECTED}}`) instead of
+  a hardcoded 12 that made the config knob a no-op; SCHEMA's `status` enum
+  gains `archived`.
+
+### Added
+
+- **Production entry-path tests.** `record --from-hook-json`, `digest --hook`'s
+  SessionStart envelope, and `bin/session_end_record.sh`'s detached spawn (plus
+  its reentrancy/empty-payload exits) are now covered end-to-end — previously a
+  hook payload-key rename passed the whole suite while breaking every real
+  capture. Also covered: `find_transcript`'s `/subagents/` exclusion, the
+  `wiki index` staged-batch guard, `reindex` mtime seeding, hook quoting, and
+  the quotePath scan fix. CI gains a guarded shellcheck step; the sync test
+  harness fail-fasts its git setup and cleans up its temp dirs.
+
+### Changed
+
+- **Doc drift swept** (mostly 0.1.16 stragglers): SKILL.md now states query is
+  pages-only by default (`--include-journal` documented), counts five
+  allow-rules, drops the `python3` invocation prefix that bypassed them, tells
+  the truth about plugin-shipped permissions being inert, and reviews held
+  batches with `git status --short` (new pages are untracked) + the refused-
+  block stash; ARCHITECTURE.md's layout gains `log.md` + `transcripts/`, the
+  config table gains the two `record.*` transcript keys, and the allow-rules
+  line lists `transcript`; README's pipeline diagram no longer claims the
+  digest reads `index.md`; the 0.1.0 changelog entry's "Stop-hook" corrected to
+  SessionEnd.
 
 ## [0.1.17] - 2026-08-03
 
@@ -647,7 +692,7 @@ a later stability milestone.
 
 ### Added
 
-- **Session capture** — a Stop-hook records each Claude Code session; a
+- **Session capture** — a SessionEnd hook records each Claude Code session; a
   classifier gates what is worth remembering into an append-only journal.
 - **Two-phase ingest** — journal entries are distilled into durable, topical
   wiki pages; every write is stage-then-promote with a deterministic risk gate

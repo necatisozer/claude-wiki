@@ -23,7 +23,7 @@ type: topic
 slug: <kebab-case>
 created: YYYY-MM-DD
 updated: YYYY-MM-DD
-status: active            # active | stale | contradicted
+status: active            # active | stale | contradicted | archived
 ---
 ```
 Body: synthesized prose (your words, not journal quotes) + `[[other-topic]]` cross-refs. End with a `## Sources` list.
@@ -38,7 +38,7 @@ type: project
 slug: <project-slug>
 created: YYYY-MM-DD
 updated: YYYY-MM-DD
-status: active            # active | stale | contradicted
+status: active            # active | stale | contradicted | archived
 ---
 ```
 Body sections (omit empty ones): `## What this is` · `## Conventions & decisions` · `## Active threads` (open follow-ups) · `## Dropped / avoided approaches` (dead ends — so a future session doesn't re-litigate them) · `## Related topics` ([[links]]) · `## Sources`.

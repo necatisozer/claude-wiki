@@ -1155,8 +1155,13 @@ def cmd_record(args):
     # so `wiki status` can honestly report "N skipped" without leaking what or where.
     if _project_excluded(cwd, cfg):
         conn = ledger()
-        conn.execute("INSERT OR REPLACE INTO sessions (session_id,first_seen,status,skip_reason) "
-                     "VALUES(?,?,?,?)", (sid, now_iso(), "skipped", "excluded"))
+        # UPDATE-in-place, mirroring _record_skip: a session recorded (maybe even folded) BEFORE
+        # the exclusion was configured must keep its row — INSERT OR REPLACE would null out
+        # summarized_at/page_path/ingested_at and orphan the on-disk, page-cited journal entry.
+        if conn.execute("UPDATE sessions SET status='skipped', skip_reason='excluded' "
+                        "WHERE session_id=?", (sid,)).rowcount == 0:
+            conn.execute("INSERT INTO sessions (session_id,first_seen,status,skip_reason) "
+                         "VALUES(?,?,?,?)", (sid, now_iso(), "skipped", "excluded"))
         conn.commit(); conn.close()
         log("record: skipped", sid, "(excluded)")   # sid only — never the excluded path or content
         return 0
@@ -1979,8 +1984,11 @@ def _ingest_select_pages(rows, model, cfg):
     if not paths:
         return []
     cap = int(cfg.get("ingest", {}).get("max_selected_pages", 12))
-    out, _cost = call_claude((CODE_ROOT / "prompts" / "ingest.select.system.md").read_text(),
-                             _build_select_input(index_block, rows), model, timeout=240)
+    # {{MAX_SELECTED}} keeps the prompt's self-cap in lockstep with the config cap — a hardcoded
+    # number in the prompt made raising ingest.max_selected_pages silently ineffective.
+    system = (CODE_ROOT / "prompts" / "ingest.select.system.md").read_text() \
+        .replace("{{MAX_SELECTED}}", str(cap))
+    out, _cost = call_claude(system, _build_select_input(index_block, rows), model, timeout=240)
     return _parse_page_selection(out, paths, cap)
 
 def _build_ingest_input(rows, selected):
@@ -2040,6 +2048,14 @@ def _set_journal_ingested(page_path, value):
     if new != txt:
         _atomic_write(p, new)                          # stage-then-promote (no symlink follow)
 
+def _journal_mtime_ns(pp):
+    """Nanosecond mtime of a journal entry, None when unreadable — the cheap change-detector the
+    ingest/record race guard compares (fold-read time vs flag-flip time)."""
+    try:
+        return os.stat(str(WIKI / pp)).st_mtime_ns
+    except OSError:
+        return None
+
 def _write_ingest_pages(result, allowlist):
     """Write the model's page blocks through stage-then-promote, enforcing the WP1 ROW 2 write guards
     BEFORE anything reaches disk: (1) path-shape (traversal/extension/tree); (2) the overwrite
@@ -2054,7 +2070,10 @@ def _write_ingest_pages(result, allowlist):
     for relpath, content in parse_file_blocks(result):
         base = os.path.basename(relpath)
         if (".." in relpath or not base.endswith(".md") or base == ".md"
-                or not (relpath.startswith("pages/topics/") or relpath.startswith("pages/projects/"))):
+                or os.path.dirname(relpath) not in ("pages/topics", "pages/projects")):
+            # dirname must be EXACTLY the flat page dirs: a nested pages/topics/a/b.md would be
+            # served by FTS search yet invisible to index.md, the whole lint sweep, and the
+            # homonym namespace (all flat globs) — an unlisted page that escapes every net.
             log("ingest: skipped unsafe path", relpath); continue
         if base[:-3].endswith("-sources"):
             # v0.1.5: companions are written ONLY by _split_oversized_page — a model-emitted
@@ -2444,6 +2463,10 @@ def _ingest_auto_batch(cfg, conn):
         return 0
     rows = rows[:cfg.get("ingest", {}).get("max_sessions_per_run", 50)]
     model = cfg.get("ingest", {}).get("model", MODEL_DEFAULTS["ingest"])
+    # Snapshot each entry's mtime BEFORE the fold reads it: the fold's LLM call runs for minutes
+    # under only ingest.lock, and a SessionEnd record (record.lock) can rewrite a resumed session's
+    # journal entry mid-fold — marking THAT entry `ingested` would claim content the fold never saw.
+    read_mtimes = {sid: _journal_mtime_ns(pp) for sid, pp in rows}
     try:
         result, cost, allowlist, selected = _ingest_two_phase(rows, model, cfg)   # ① select, ② fold
     except Exception as e:
@@ -2477,33 +2500,40 @@ def _ingest_auto_batch(cfg, conn):
     written = _finalize_ingest_pages(written, cfg)   # WP4 ROW 6 — chronological Sources + 160-line split
     regenerate_index()
     slugs = ", ".join(sorted({os.path.splitext(os.path.basename(w))[0] for w in written}))
-    for _, pp in rows:
+    # Entries rewritten since the fold READ them (a resumed session's re-record landed mid-fold)
+    # stay un-ingested: their NEW content never reached any page, and the next run re-folds them
+    # (merge semantics converge — the fold re-emits full page bodies).
+    fold_rows = [(sid, pp) for sid, pp in rows if _journal_mtime_ns(pp) == read_mtimes.get(sid)]
+    if len(fold_rows) < len(rows):
+        log("ingest auto: %d journal entr%s rewritten mid-fold — left un-ingested for re-fold"
+            % (len(rows) - len(fold_rows), "y" if len(rows) - len(fold_rows) == 1 else "ies"))
+    for _, pp in fold_rows:
         _set_journal_ingested(pp, True)   # durable flag, committed with this batch (exact path below)
     # v0.1.8 — commit EXACT paths, not the bare `pages`/`journal` pathspecs: this runs unattended, and
     # a broad pathspec would sweep the user's concurrent hand-edits to unrelated pages into an
     # engine-authored commit. (The interactive --accept flow keeps the broad spec on purpose — there
     # the user just reviewed the whole diff, hand-fixes included.)
-    _oplog("ingest", "%d session(s) → %s" % (len(rows), slugs))
-    batch_paths = [p for p in written + ["index.md", "log.md"] + [pp for _, pp in rows if pp]
+    _oplog("ingest", "%d session(s) → %s" % (len(fold_rows), slugs))
+    batch_paths = [p for p in written + ["index.md", "log.md"] + [pp for _, pp in fold_rows if pp]
                    if (WIKI / p).exists()]
-    r = git_commit_paths("ingest (auto): %d sessions → %s" % (len(rows), slugs), *batch_paths)
+    r = git_commit_paths("ingest (auto): %d sessions → %s" % (len(fold_rows), slugs), *batch_paths)
     if r.returncode != 0:
         # v0.1.5 (integrity-audit I5): NEVER advance the ledger past a failed commit — written pages
         # would sit uncommitted (invisible to digest/HEAD) while the ledger claims them folded. Leave
         # everything for the next run: the fold re-emits full page bodies, so a retry converges.
         # The flipped frontmatter flags must be reverted too — reindex seeds ingested_at from
         # frontmatter, so an uncommitted `true` would cancel the retry this branch promises.
-        for _, pp in rows:
+        for _, pp in fold_rows:
             _set_journal_ingested(pp, False)
         log("ingest auto ERROR: git commit failed (%s) — ledger NOT advanced, will retry"
             % (r.stderr or r.stdout or "").strip()[:200])
         return 0
-    for sid, _ in rows:
+    for sid, _ in fold_rows:
         conn.execute("UPDATE sessions SET ingested_at=?, ingested_by='auto' WHERE session_id=?",
                      (now_iso(), sid))
     conn.commit()
-    log("ingest auto: committed %d sessions ($%s) → %s" % (len(rows), cost, slugs))
-    return len(rows)
+    log("ingest auto: committed %d sessions ($%s) → %s" % (len(fold_rows), cost, slugs))
+    return len(fold_rows)
 
 def ingest_if_due(cfg):
     """Detached daily compile-trigger. Lock-guarded + day-claimed so concurrent session
@@ -2728,11 +2758,14 @@ def _lint_open_count(f):
                                    "dup_title", "desc_long", "poison", "bad_cite", "homonym", "stale"))
 
 _HIGH_SEV_RX = re.compile(r"(?im)\[\s*high\s*\]")
+_DET_CONFIRM_RX = re.compile(r"(?ims)^##\s*Deterministic findings.*?(?=^##\s|\Z)")
 
 def _count_high_findings(report):
     """WP4 ROW 1 — parse the LLM semantic review's [high]-severity findings so they reach lint_open
-    too (previously only deterministic findings did). Count of `[high]` severity tags in the report."""
-    return len(_HIGH_SEV_RX.findall(report or ""))
+    too (previously only deterministic findings did). The confirm/dismiss echo of the deterministic
+    findings is EXCLUDED: those are already tallied by _lint_open_count, so a `[high]` tag there
+    (the prompt forbids it, but the model may slip) would double-count the same finding."""
+    return len(_HIGH_SEV_RX.findall(_DET_CONFIRM_RX.sub("", report or "")))
 
 def run_lint(cfg):
     """Full-wiki sweep: deterministic checks + LLM semantic review → lint-report.md (review-only)."""
@@ -3243,8 +3276,16 @@ def reindex_ledger():
     INSERTs missing rows — marking them summarized so they're not re-recorded — and refreshes
     metadata on existing rows. ingested state is seeded from each entry's durable `ingested:`
     frontmatter flag (written at ingest time), so a from-scratch rebuild does NOT re-fold
-    already-ingested history; an existing ledger's ingested_at is preserved via COALESCE."""
+    already-ingested history; an existing ledger's ingested_at is preserved via COALESCE.
+    last_mtime is seeded from the on-disk transcript (one glob pass, not per-sid): the
+    not-re-recorded promise depends on it — the idempotency check requires a non-NULL
+    last_mtime, so a rebuild that left it NULL re-ran the record LLM over every session
+    whose transcript still existed."""
     conn = ledger()
+    tmap = {}                                 # sid → live transcript path (subagents excluded)
+    for tp in glob.glob(str(PROJECTS / "**" / "*.jsonl"), recursive=True):
+        if "/subagents/" not in tp.replace(os.sep, "/"):
+            tmap.setdefault(Path(tp).stem, tp)
     n = 0
     for p in glob.glob(str(WIKI / "journal" / "**" / "*.md"), recursive=True):
         if _under_journal_archive(p):
@@ -3256,18 +3297,24 @@ def reindex_ledger():
         summ = fm.get("ended") or fm.get("date") or now_iso()
         ingested = str(fm.get("ingested", "")).strip().lower() == "true"
         ing_at = summ if ingested else None
+        tpath, tmtime = tmap.get(sid), None
+        if tpath:
+            with contextlib.suppress(OSError):
+                tmtime = int(os.path.getmtime(tpath))
         conn.execute("""INSERT INTO sessions
                 (session_id, project, page_path, summarized_at, summarized_by, date, title, description,
-                 ingested_at, ingested_by)
-            VALUES(?,?,?,?,'reindex',?,?,?,?,?)
+                 ingested_at, ingested_by, transcript_path, last_mtime)
+            VALUES(?,?,?,?,'reindex',?,?,?,?,?,?,?)
             ON CONFLICT(session_id) DO UPDATE SET
                 project=excluded.project, page_path=excluded.page_path, date=excluded.date,
                 title=excluded.title, description=excluded.description,
                 summarized_at=COALESCE(sessions.summarized_at, excluded.summarized_at),
-                ingested_at=COALESCE(sessions.ingested_at, excluded.ingested_at)""",
+                ingested_at=COALESCE(sessions.ingested_at, excluded.ingested_at),
+                transcript_path=COALESCE(sessions.transcript_path, excluded.transcript_path),
+                last_mtime=COALESCE(sessions.last_mtime, excluded.last_mtime)""",
             (sid, fm.get("project"), os.path.relpath(p, WIKI), summ,
              fm.get("date"), fm.get("name"), fm.get("description"),
-             ing_at, ("reindex" if ingested else None)))
+             ing_at, ("reindex" if ingested else None), tpath, tmtime))
         n += 1
     conn.commit()
     return n
@@ -3955,7 +4002,10 @@ def _scan_range(range_expr):
     """Per-commit scan of a rev range: added lines (+ binary refuse) + commit messages.
     Fail-closed: if the rev-walk itself errors (e.g. an unreachable/unknown sha), a real scan
     never ran — treat that as a blocking finding rather than silently returning empty."""
-    diff = git("log", "-p", "--unified=0", "--no-renames", "--diff-merges=first-parent", range_expr)
+    # quotePath=false: a non-ASCII filename would otherwise render as `"a/…" "b/…"` and break the
+    # ` b/` filename parse in _scan_log_output — leaving its binary-refuse finding unattributed.
+    diff = git("-c", "core.quotePath=false", "log", "-p", "--unified=0", "--no-renames",
+               "--diff-merges=first-parent", range_expr)
     if diff.returncode != 0:
         return [("(rev-walk failed: %s)" % range_expr, "scan_error", "gate fails closed")]
     findings = _scan_log_output(diff.stdout)
@@ -4085,8 +4135,10 @@ def _write_prepush_hook():
     engine = _engine_for_hook()
     _atomic_write(hook, "#!/bin/sh\n"
                     "# session-wiki secret-gate backstop (generated by `wiki sync --init`)\n"
-                    'export WIKI_HOME="%s"\n'
-                    'exec "%s" "%s" _scrub-check\n' % (WIKI, sys.executable, engine))
+                    "export WIKI_HOME=%s\n"
+                    "exec %s %s _scrub-check\n"   # shlex-quoted: a `$`/quote in a path must not
+                    % (shlex.quote(str(WIKI)), shlex.quote(sys.executable),   # expand inside the hook
+                       shlex.quote(str(engine))))
     os.chmod(str(hook), 0o755)
     git("config", "core.hooksPath", ".githooks")
     return hook
@@ -4438,8 +4490,10 @@ def _sync_pull():
     if not cfg.get("enabled"):
         return True
     branch = cfg.get("branch", "main")
-    before = git("rev-parse", "HEAD").stdout.strip()
     with file_lock(WIKI / "state" / "gitwrite.lock"):
+        # `before` is read INSIDE the lock: a record commit landing between a pre-lock snapshot
+        # and the pull would be silently discarded by the validation-failure reset below.
+        before = git("rev-parse", "HEAD").stdout.strip()
         pulled = git_net("pull", "--rebase", "origin", branch)   # 120s cap — a TCP stall must not hold the lock
         if pulled.returncode != 0:
             if (WIKI / ".git" / "rebase-merge").exists() or (WIKI / ".git" / "rebase-apply").exists():

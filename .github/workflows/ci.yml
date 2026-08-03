@@ -11,4 +11,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+      # best-effort shell lint (shellcheck ships on ubuntu runners; guarded so its absence
+      # elsewhere never fails the build — bash -n in the suite still catches syntax)
+      - run: if command -v shellcheck >/dev/null; then shellcheck -S warning install.sh bin/session_end_record.sh; fi
       - run: python3 tests/run.py

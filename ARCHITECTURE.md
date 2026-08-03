@@ -106,7 +106,7 @@ inert until a future, deliberately-designed Phase B folds recurring demand into 
 built yet: measured organic volume is ~1 recall session/month, below any honest threshold).
 
 Awareness lives in the digest; depth lives in the on-demand primitives. The plugin ships scoped
-allow-rules (`Bash(...wiki query|status|doctor:*)` + `Read(~/.claude/wiki/**)`) so these read surfaces
+allow-rules (`Bash(...wiki query|status|doctor|transcript:*)` + `Read(~/.claude/wiki/**)`) so these read surfaces
 run prompt-free — see the README's permission-setup note (plugin-shipped permissions are not yet
 auto-granted by Claude Code, so users copy the rules into their own settings).
 
@@ -162,6 +162,10 @@ the engine**; **stage-then-promote every write**. Concretely:
   `journal/archive/YYYY/MM` after `journal.archive_after_days`.
 - `index.md` — auto-generated page catalog (never hand-edited; never lists sessions).
 - `lint-report.md` — latest lint sweep.
+- `log.md` — append-only operations log (one `- <utc-iso> · <kind> · <detail>` line per
+  record/ingest/lint/retention pass; engine-written, committed with each operation).
+- `transcripts/` — opt-in (`record.sync_transcripts`) redacted, gzipped transcript copies, tracked
+  and synced; read back by `wiki transcript <sid8>`.
 - `config.json` — settings (synced). `state/config.local.json` — per-device overrides (untracked;
   holds the `sync` block). `SCHEMA.md` — data-repo copy is author residue, not read.
 - `state/` — local, rebuildable: the ledger (sqlite), locks, run-stamps, `push_blocked`, `drift.json`;
@@ -183,6 +187,8 @@ unknown keys, wrong types, and out-of-range values are **advisory** (listed, non
 | `record.subagent_cap` | `30` | Max subagent transcripts folded into one record. |
 | `record.max_assistant_chars` | `1200` | Per-assistant-turn char cap in the cleaned body. |
 | `record.max_user_chars` | `1500` | Per-user-turn char cap in the cleaned body. |
+| `record.archive_transcripts` | `false` | Local raw-source durability: gzip the raw transcript into untracked `state/transcripts/` at record time. |
+| `record.sync_transcripts` | `false` | Cross-device tier: redacted gzip copy in tracked `transcripts/`, synced with the repo. |
 | `digest.recent_sessions` | `12` | How many recents the digest lists. |
 | `digest.max_chars` | `4000` | Hard cap on the injected digest size. |
 | `digest.max_recent_lines` | `20` | Hard cap on recent lines (backlog can't explode the digest). |

@@ -205,4 +205,32 @@ assert r.returncode == 0, r.stdout + r.stderr
 assert len(glob.glob(str(W4B / "journal" / "**" / "*.md"), recursive=True)) == 1, "empty list → must record"
 print("ok 4: projects.exclude absent or empty → normal recording (behavior unchanged)")
 
+# =============================================================================================
+# 5. LATE EXCLUSION — a session recorded BEFORE the path was excluded keeps its ledger row when
+#    it later re-records under the exclusion: only status/skip_reason change (UPDATE-in-place,
+#    never INSERT OR REPLACE). Nulling summarized_at/page_path would orphan the on-disk,
+#    page-cited journal entry and re-queue the session.
+# =============================================================================================
+W5 = mkdtemp("excl_w5_")
+write_config(W5, {"enabled": True})                                   # not yet excluded
+T5 = mkdtemp("excl_t5_")
+SID5 = "eeee0005-0000-4000-8000-000000000005"
+tpath5 = T5 / "t.jsonl"
+build_transcript(tpath5, SID5, "/Users/necatisozer/dev/latex", "ZmarkerLateZ")
+r = run_engine(["record", "--session", SID5, "--transcript", str(tpath5),
+                "--cwd", "/Users/necatisozer/dev/latex", "--trigger", "manual"], W5)
+assert r.returncode == 0, r.stdout + r.stderr
+before = ledger_row(W5, SID5, ["summarized_at", "page_path"])
+assert before and before[0] and before[1], "setup: session must have recorded: %r" % (before,)
+
+write_config(W5, {"enabled": True, "projects": {"exclude": ["/Users/necatisozer/dev/latex"]}})
+r = run_engine(["record", "--session", SID5, "--transcript", str(tpath5),
+                "--cwd", "/Users/necatisozer/dev/latex", "--trigger", "manual"], W5)
+assert r.returncode == 0, r.stdout + r.stderr
+after = ledger_row(W5, SID5, ["status", "skip_reason", "summarized_at", "page_path"])
+assert after[0] == "skipped" and after[1] == "excluded", after
+assert after[2] == before[0] and after[3] == before[1], \
+    "a late exclusion must not clobber the prior good row (UPDATE-in-place): %r" % (after,)
+print("ok 5: late exclusion keeps the prior recorded row (status flips, provenance survives)")
+
 print("PASS test_projects_exclude")
