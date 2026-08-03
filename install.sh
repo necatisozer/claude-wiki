@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # claude-wiki one-line installer: plugin install + memory init/restore.
-#   curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.17/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.18/install.sh | bash
 #   curl -fsSL … | bash -s -- owner/repo     # explicit memory repo (restore TARGET)
 # Passes --yes to `wiki init` only when stdin is NOT a terminal (curl|bash has no usable stdin).
 # For interactive confirms: download this file and run it directly — a real TTY drops --yes.
@@ -21,7 +21,7 @@ fi
 # unsafe after the 0.1.0 fresh-root history reset — a stale pre-reset clone (1.x) beats 0.x
 # numerically forever while its `git pull` (how `marketplace update` refreshes) permanently
 # fails against the unrelated new history, so it would silently keep serving the old engine.
-EXPECT="0.1.17"
+EXPECT="0.1.18"
 # Same config-dir resolution as bin/wiki and session_end_record.sh — a relocated CLAUDE_CONFIG_DIR
 # moves the marketplace clone (and thus the manifest + engine) with it.
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
