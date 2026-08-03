@@ -322,11 +322,17 @@ assert "now enforces [[rate-limiting]]" in ap.read_text()
 # … and neither malformed block escaped the pages/ tree
 assert not (WA / "pages" / "escape.md").exists()
 assert not (WA / "secrets").exists()
-# ingest regenerated the index and staged the session for review
-idx = (WA / "index.md").read_text()
-assert "[[rate-limiting]]" in idx and "[[apigw]]" in idx
+# staged for review — and index.md is NOT regenerated from the unreviewed staged tree (live
+# sessions Read index.md directly; rebuilding it pre-review would leak staged page descriptions
+# around the held-ingest quarantine). It is rebuilt by --accept below.
+assert not (WA / "index.md").exists(), "index.md must not be rebuilt while the batch is staged"
 staged = json.loads((WA / "state" / "pending_ingest.json").read_text())
 assert staged == [CLEAN_SID], staged
-print("ok 9: ingest wrote valid pages, skipped malformed blocks, staged the batch")
+r = run_engine(["ingest", "--accept"], WA)
+assert r.returncode == 0, r.stdout + r.stderr
+idx = (WA / "index.md").read_text()
+assert "[[rate-limiting]]" in idx and "[[apigw]]" in idx, "accept must regenerate the index:\n" + idx
+assert not (WA / "state" / "pending_ingest.json").exists(), "accept must clear the pending flag"
+print("ok 9: ingest wrote valid pages, skipped malformed blocks, staged; accept rebuilt the index")
 
 print("PASS test_pipeline_golden")

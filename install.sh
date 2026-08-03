@@ -2,8 +2,10 @@
 # claude-wiki one-line installer: plugin install + memory init/restore.
 #   curl -fsSL https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.17/install.sh | bash
 #   curl -fsSL … | bash -s -- owner/repo     # explicit memory repo (restore TARGET)
-# Non-interactive by necessity (curl|bash has no usable stdin) → passes --yes to `wiki init`.
-# For interactive confirms: download this file and run it directly.
+# Passes --yes to `wiki init` only when stdin is NOT a terminal (curl|bash has no usable stdin).
+# For interactive confirms: download this file and run it directly — a real TTY drops --yes.
+# Unattended automation that allocates a pty (ssh -t, CI wrappers): set WIKI_INSTALL_YES=1 to
+# force --yes regardless of the terminal.
 set -euo pipefail
 need() { command -v "$1" >/dev/null 2>&1 || { echo "error: '$1' not found — install it first" >&2; exit 1; }; }
 need claude; need git; need python3
@@ -53,4 +55,8 @@ if printf '%s' "$LIST" | grep -A3 "wiki@claude-wiki" | grep -qi "disabled"; then
   echo "error: plugin installed but disabled — run: claude plugin enable wiki@claude-wiki" >&2; exit 1
 fi
 ENGINE="${WIKI_INSTALL_ENGINE:-$CLAUDE_DIR/plugins/marketplaces/claude-wiki/bin/wiki}"
-exec python3 "$ENGINE" init ${1:+"$1"} --yes
+YES="--yes"
+if [ -t 0 ] && [ -z "${WIKI_INSTALL_YES:-}" ]; then
+  YES=""   # real terminal on stdin → let `wiki init` prompt instead of assuming yes
+fi
+exec python3 "$ENGINE" init ${1:+"$1"} ${YES:+"$YES"}

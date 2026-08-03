@@ -70,8 +70,19 @@ def fake_env(version=EXPECT, readd_version=EXPECT, listed=True, enabled=True, gh
            "WIKI_INSTALL_ENGINE": str(d / "engine")}
     return env
 
-def run_sh(env, *args):
-    return subprocess.run(["bash", str(SH), *args], capture_output=True, text=True, env=env)
+def run_sh(env, *args, tty=False):
+    # stdin=DEVNULL pins the non-TTY branch (--yes) even when the suite itself runs from a terminal;
+    # tty=True allocates a pty on stdin to drive the interactive branch.
+    if not tty:
+        return subprocess.run(["bash", str(SH), *args], capture_output=True, text=True, env=env,
+                              stdin=subprocess.DEVNULL)
+    import pty
+    m_fd, s_fd = pty.openpty()
+    try:
+        return subprocess.run(["bash", str(SH), *args], capture_output=True, text=True, env=env,
+                              stdin=s_fd)
+    finally:
+        os.close(m_fd); os.close(s_fd)
 
 def claude_log(env):
     p = Path(env["WIKI_INSTALL_ENGINE"]).parent / "claude.log"
@@ -118,4 +129,15 @@ assert "plugin marketplace remove claude-wiki" in claude_log(env), \
 r = run_sh(fake_env(version="1.10.0", readd_version="1.10.0"))
 assert r.returncode == 1 and "ENGINE-CALLED" not in r.stdout, \
     "1.10.0 must NOT satisfy the exact-match gate\n" + r.stdout + r.stderr
+# TTY branch: a real terminal on stdin must DROP --yes so `wiki init` can prompt — this is the
+# "download and run it locally for interactive confirms" promise in SECURITY.md/README.
+r = run_sh(fake_env(), tty=True)
+assert r.returncode == 0 and "ENGINE-CALLED init" in r.stdout, r.stdout + r.stderr
+assert "--yes" not in r.stdout, "a TTY on stdin must drop --yes (interactive confirms):\n" + r.stdout
+# WIKI_INSTALL_YES=1 forces --yes even on a pty — the unattended-automation escape hatch
+# (ssh -t / CI wrappers allocate a tty; without this the install would hang at the confirm).
+env = fake_env(); env["WIKI_INSTALL_YES"] = "1"
+r = run_sh(env, tty=True)
+assert r.returncode == 0 and "ENGINE-CALLED init --yes" in r.stdout, \
+    "WIKI_INSTALL_YES=1 must force --yes even with a pty on stdin:\n" + r.stdout + r.stderr
 print("ok test_install_sh")

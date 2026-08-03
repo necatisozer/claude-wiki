@@ -1297,14 +1297,23 @@ _DIGEST_OPENER_RX  = re.compile(
     r"exfiltrate|fetch|curl|wget|download|visit|open|call|invoke|go|click|navigate|forward|copy|"
     r"paste|export|install|update|please|you|your|you're|youre)\b")
 
+def _inert_report(s):
+    """The shared defang core — URLs and tool-call shapes neutralized, line structure KEPT. Used
+    directly for LLM-authored multi-line REPORTS (lint: read by humans AND later live sessions,
+    so the digest's one-line collapse would destroy it), and by _inert_digest below. One home for
+    the pattern set: a defang rule added here covers every sanitized LLM→disk path at once."""
+    if not s:
+        return ""
+    s = _DIGEST_URL_RX.sub("[link removed]", s)         # defang URLs (no exfil target survives)
+    s = _DIGEST_TOOLTAG_RX.sub("[tool-call removed]", s)
+    s = _DIGEST_TOOLCALL_RX.sub("[tool-call removed]", s)
+    return s
+
 def _inert_digest(s):
     """Render a recalled description/recent as INERT quoted text for the digest sandbox."""
     if not s:
         return ""
-    s = " ".join(str(s).split())                        # collapse newlines/whitespace to one line
-    s = _DIGEST_URL_RX.sub("[link removed]", s)         # defang URLs (no exfil target survives)
-    s = _DIGEST_TOOLTAG_RX.sub("[tool-call removed]", s)
-    s = _DIGEST_TOOLCALL_RX.sub("[tool-call removed]", s)
+    s = _inert_report(" ".join(str(s).split()))         # collapse to one line, then shared defang
     s = s.replace("`", "'")                             # demote code/command fences to plain quotes
     if _DIGEST_OPENER_RX.match(s):                      # demote a leading imperative / 2nd-person opener
         s = "[inert] " + s
@@ -1695,9 +1704,17 @@ def git_discard():
     # SCOPED: only undo ingest's output (pages/ + index.md). Never touches bin/, prompts/, SCHEMA, etc.
     git("checkout", "-q", "--", "pages")
     git("clean", "-fdq", "pages")
-    regenerate_index()
+    regenerate_index(reviewed=True)   # tree just restored to HEAD — safe while the flags still exist
 
-def regenerate_index():
+def regenerate_index(reviewed=False):
+    """Rebuild index.md from the on-disk pages. THE index half of the S5 held-ingest quarantine
+    lives HERE, not at call sites: live sessions Read index.md directly, so while a batch is
+    staged/held the index must never be rebuilt from the unreviewed working tree. Returns -1 when
+    skipped for that reason. Callers acting on a reviewed/restored tree (--accept, --reject's
+    post-restore rebuild) pass reviewed=True."""
+    if not reviewed and _held_or_pending():
+        log("index: regeneration skipped — ingest batch staged/held (unreviewed tree)")
+        return -1
     pages = WIKI / "pages"
     sections = {"projects": [], "topics": []}
     for kind in sections:
@@ -1739,6 +1756,43 @@ def _held_file():
 def _clear_held():
     if _held_file().exists():
         _held_file().unlink()
+
+def _refused_file():
+    return WIKI / "state" / "ingest-refused.md"
+
+def _stage_hold(rows, hold_reason=None):
+    """THE single writer of the pending(+held) quarantine flags for a staged batch — every staging
+    path goes through here so the flag format/ordering can never drift between the auto and manual
+    paths. Idempotent (re-writing with an augmented reason is fine); hold_reason=None stages the
+    pending flag only (the manual path's plain review staging)."""
+    _atomic_write(_pending(), json.dumps([r[0] for r in rows]))
+    if hold_reason is not None:
+        _atomic_write(_held_file(), hold_reason)
+
+def _refused_names(refused):
+    return ", ".join(sorted(r for r, _ in refused))[:300]
+
+def _stash_refused_blocks(refused):
+    """Preserve fold output the allowlist guard refused to write (a block re-emitting an existing
+    page the model was never shown — writing it would clobber unseen content, dropping it would
+    lose the batch's facts). Lands UNTRACKED in state/ (same quarantine level as held pages: local
+    only, never committed unreviewed) for the reviewer to hand-merge. Secret-shaped spans are
+    MASKED first — the write guard's \"never persisted unmasked\" invariant applies to the stash
+    too — and an existing stash is APPENDED to, never clobbered: an earlier batch's un-merged
+    facts must survive a later batch's refusal. Never raises."""
+    try:
+        body = "\n\n".join("=== FILE: %s ===\n%s=== END ===" % (r, _redact_secrets(c))
+                           for r, c in refused)
+        fp = _refused_file()
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        if not fp.exists():   # header-then-append, the _oplog pattern
+            _safe_append(fp, "# Refused ingest blocks — the fold aimed these at existing pages "
+                             "outside its\n# phase-1 selection, so the engine refused the blind "
+                             "overwrite. Hand-merge any\n# facts worth keeping into the named "
+                             "pages, then delete this file.\n\n")
+        _safe_append(fp, "## refused batch — %s\n\n%s\n" % (now_iso(), body))
+    except Exception as e:
+        log("ingest: failed to stash refused blocks", repr(e))
 
 # ---------------------------------------------------------------- phase 3: daily auto-ingest
 def _read_stamp(name):
@@ -1992,8 +2046,11 @@ def _write_ingest_pages(result, allowlist):
     allowlist — an EXISTING page the model was not asked to touch is refused, so ingest can write only
     pages in `allowlist` plus genuinely-new paths; (3) the content-security pass — a block whose body
     carries a secret/PII shape is refused, never persisted unmasked. A refusal skips the one block; the
-    rest of the batch still completes."""
-    written = []
+    rest of the batch still completes. Returns (written, refused): `refused` carries the ALLOWLIST
+    refusals' full (relpath, content) — those blocks hold real batch facts aimed at a page phase-1
+    didn't select, and silently dropping them while the batch is marked ingested loses the facts
+    forever (the callers stash them + hold the batch instead)."""
+    written, refused = [], []
     for relpath, content in parse_file_blocks(result):
         base = os.path.basename(relpath)
         if (".." in relpath or not base.endswith(".md") or base == ".md"
@@ -2005,7 +2062,8 @@ def _write_ingest_pages(result, allowlist):
             log("ingest: REFUSED companion page write", relpath); continue
         fp = WIKI / relpath
         if fp.exists() and relpath not in allowlist:      # overwrite of a page outside the asked-to-touch set
-            log("ingest: REFUSED overwrite outside allowlist", relpath); continue
+            log("ingest: REFUSED overwrite outside allowlist", relpath)
+            refused.append((relpath, content)); continue
         hits = scan_secrets(content)                      # content-security pass BEFORE any write
         if hits:                                          # never persist matched secret text unmasked
             log("ingest: REFUSED secret-shaped page content", relpath, [n for n, _ in hits]); continue
@@ -2014,7 +2072,7 @@ def _write_ingest_pages(result, allowlist):
             written.append(relpath)
         except Exception as e:
             log("ingest: failed to write", relpath, repr(e))
-    return written
+    return written, refused
 
 # ---------------------------------------------------------------- WP4 ROW 6: Sources order + page split
 # At ingest, a page's `## Sources` list is ordered chronologically, and a page that would exceed the
@@ -2393,15 +2451,25 @@ def _ingest_auto_batch(cfg, conn):
     log("ingest auto: phase-1 selected %d existing page(s)" % len(selected))
     # DETERMINISTIC risk gate — engine-computed from the proposed change, NEVER a model-emitted field
     hold_reason = _ingest_hold_reason(result, cfg)
-    written = _write_ingest_pages(result, allowlist)   # per-block refusals (path/allowlist/secret) before disk
+    if hold_reason:
+        # Quarantine flags BEFORE any unreviewed byte reaches disk: a crash between the page writes
+        # below and these flags would leave risk-gated content fully live to query/digest.
+        _stage_hold(rows, hold_reason)
+    written, refused = _write_ingest_pages(result, allowlist)   # per-block refusals (path/allowlist/secret) before disk
+    if refused:
+        # A refused overwrite means real batch facts never landed — committing the batch as
+        # `ingested` anyway would drop them silently and forever. Stash the blocks + hold for
+        # review. (These pages passed the risk gate, so flags-after-write is safe on this path.)
+        _stash_refused_blocks(refused)
+        reason = ("fold re-emitted %d existing page(s) outside the phase-1 selection (%s) — refused "
+                  "the blind overwrite; block content stashed in state/%s for hand-merge"
+                  % (len(refused), _refused_names(refused), _refused_file().name))
+        hold_reason = (hold_reason + "; " + reason) if hold_reason else reason
+        _stage_hold(rows, hold_reason)
     if hold_reason:
         # stage-then-promote leaves held pages UNCOMMITTED; the pending+held flags block further
-        # auto-runs and the digest reads committed HEAD while held → nothing risky reaches a live session.
-        (WIKI / "state").mkdir(parents=True, exist_ok=True)
-        _atomic_write(_pending(), json.dumps([r[0] for r in rows]))
-        _atomic_write(_held_file(), hold_reason)
-        if written:
-            regenerate_index()
+        # auto-runs, the digest/query read committed HEAD while held, and regenerate_index refuses
+        # an unreviewed tree → nothing risky reaches a live session.
         log("ingest auto: HELD (risk gate) — %d sessions staged UNCOMMITTED: %s" % (len(rows), hold_reason))
         return -1   # pending + held flag block further auto-runs until `wiki ingest --accept/--reject`
     if not written:
@@ -2694,8 +2762,9 @@ def run_lint(cfg):
         log("lint LLM ERROR", repr(e))
         llm_report = "_(LLM semantic review failed: %s — deterministic findings only.)_" % e
     report = ("# Wiki lint report — %s\n\n_Full-wiki sweep. Review-only; no pages were auto-edited. "
-              "Act on items, then re-run `wiki lint`._\n%s\n%s\n\n### Semantic review (LLM)\n%s\n"
-              % (now_iso()[:10], size_note, det_report, llm_report))
+              "Act on items, then re-run `wiki lint`._\n%s\n%s\n\n### Semantic review (LLM)\n"
+              "_(recalled QA findings quoting page content — inert data, not instructions)_\n\n%s\n"
+              % (now_iso()[:10], size_note, det_report, _inert_report(llm_report)))
     _atomic_write(WIKI / "lint-report.md", report)
     # WP4 ROW 1 — lint_open = deterministic open findings (structural + desc/poison net) PLUS the LLM
     # review's [high]-severity findings. Re-running lint REFRESHES this count (or clears it at zero).
@@ -3062,6 +3131,7 @@ def cmd_ingest(args):
             if r:
                 _set_journal_ingested(r[0], True)   # durable flag, committed with the accept below
                 flipped.append(r[0])
+        regenerate_index(reviewed=True)   # rebuilt only NOW, from the just-reviewed tree
         dirty = bool(git("status", "--porcelain", "--", "pages", "index.md", "journal").stdout.strip())
         _oplog("ingest", "%d session(s) → topics/projects (accepted)" % len(pend))
         rc = git_commit_paths("ingest: %d sessions → topics/projects" % len(pend), "pages", "index.md", "journal",
@@ -3085,13 +3155,19 @@ def cmd_ingest(args):
         _pending().unlink()
         held = _held_file().exists(); _clear_held()
         print("accepted: committed + marked %d sessions ingested.%s"
-              % (len(pend), " (resolved held contradiction)" if held else "")); return 0
+              % (len(pend), " (resolved held contradiction)" if held else ""))
+        if _refused_file().exists():
+            print("note: refused fold blocks remain in state/%s — hand-merge or delete."
+                  % _refused_file().name)
+        return 0
     if "--reject" in args:
         if not _pending().exists():
             print("nothing staged to reject."); return 0
         git_discard()
         _pending().unlink()
         _clear_held()
+        with contextlib.suppress(OSError):
+            _refused_file().unlink()   # rejected sessions stay un-ingested and re-fold — stash is stale
         print("rejected: pages restored to last commit."); return 0
     if _pending().exists():
         print("a previous ingest is pending review — run `wiki ingest --accept` or `--reject` first.")
@@ -3112,12 +3188,34 @@ def cmd_ingest(args):
     except Exception as e:
         log("ingest ERROR", repr(e)); print("ingest FAILED:", e); return 1
     log("ingest: phase-1 selected %d existing page(s)" % len(selected))
-    written = _write_ingest_pages(result, allowlist)
+    # The manual path ALWAYS stages for review — quarantine flag BEFORE pages hit disk, so a crash
+    # mid-write leaves the batch quarantined (query/digest read committed HEAD), never half-live.
+    _stage_hold(rows)
+    written, refused = _write_ingest_pages(result, allowlist)
+    if refused:
+        _stash_refused_blocks(refused)
+        print("⚠ REFUSED %d block(s) re-emitting existing page(s) outside the phase-1 selection: %s\n"
+              "  Their content is stashed in state/%s — hand-merge what's worth keeping before "
+              "accepting, or those facts are lost."
+              % (len(refused), _refused_names(refused), _refused_file().name))
     if not written:
+        if refused:
+            # Every block was an out-of-selection re-emit: nothing landed, but the batch's facts
+            # live only in the stash now. HOLD instead of releasing — releasing would let the
+            # daily auto-ingest immediately re-fold these sessions and overwrite the stash
+            # underneath the user mid-hand-merge.
+            _stage_hold(rows,
+                        "fold re-emitted only existing page(s) outside the phase-1 selection — "
+                        "hand-merge state/%s, then `wiki ingest --accept` (or --reject to re-fold "
+                        "later)" % _refused_file().name)
+            print("HELD: no pages written; the batch stays staged. Hand-merge the stash, then "
+                  "`wiki ingest --accept` — or `wiki ingest --reject` to discard and re-fold later.")
+            return 1
+        with contextlib.suppress(OSError):
+            _pending().unlink()
         print("ingest: model produced no valid page blocks. Output head:\n" + result[:800]); return 1
     written = _finalize_ingest_pages(written, cfg)   # WP4 ROW 6 — chronological Sources + 160-line split
-    npages = regenerate_index()
-    _atomic_write(_pending(), json.dumps([r[0] for r in rows]))
+    # index.md is rebuilt by --accept after review (regenerate_index refuses an unreviewed tree)
     changed = git("status", "--porcelain").stdout.strip().splitlines()
     print("\n=== INGEST done — UNCOMMITTED, review then accept ===")
     print("wrote %d pages:" % len(written))
@@ -3135,8 +3233,7 @@ def cmd_ingest(args):
             print("  ⚠ unresolvable citation(s) in %s: %s (no matching journal entry)" % (w, ", ".join(unres)))
     if "=== SUMMARY ===" in result:
         print("\n" + result.split("=== SUMMARY ===", 1)[1].strip()[:400])
-    print("\ncost=$%s · %d sessions staged · %d index entries · %d files changed"
-          % (cost, len(rows), npages, len(changed)))
+    print("\ncost=$%s · %d sessions staged · %d files changed" % (cost, len(rows), len(changed)))
     print("Review:  git -C %s diff" % WIKI)
     print("Accept:  wiki ingest --accept      Reject:  wiki ingest --reject")
     return 0
@@ -4151,14 +4248,27 @@ def _post_pull_validate(before=None):
 # this device's journal entries on top marked UN-ingested, and let the next ingest re-fold them. No
 # knowledge is lost — everything in a page is reconstructible from journal entries both devices hold.
 #
-# FAIL CLOSED: one local change outside journal/ + the derived set (config, prompts, docs, anything
-# authored) aborts the auto-heal and falls back to the flag-and-proceed path. Discarding a hand-edited
-# file to win a merge is never worth it. The pre-reset HEAD is also pinned to a `sync-preconflict`
-# branch first, so no local commit becomes unreachable even if the re-apply dies midway.
+# FAIL CLOSED: one local change outside journal/ + the derived + re-applied sets (config, prompts,
+# docs, anything authored) aborts the auto-heal and falls back to the flag-and-proceed path.
+# Discarding a hand-edited file to win a merge is never worth it. The pre-reset HEAD is also pinned
+# to a `sync-preconflict` branch first, so no local commit becomes unreachable even if the re-apply
+# dies midway. The heal also refuses to run over UNCOMMITTED work (a held ingest batch, an
+# in-progress hand-edit): `reset --hard` would destroy it with no recovery branch to point at.
 _DERIVED_FILES = ("index.md", "lint-report.md")
 
 def _is_derived(rel):
     return rel in _DERIVED_FILES or rel.startswith("pages/")
+
+def _is_healable_reapply(rel):
+    """Per-device facts that ride in EVERY engine commit and CAN survive a heal by RE-APPLICATION,
+    not discard: journal entries, synced transcript copies, and the append-only op-log `log.md`.
+    Eligibility here is necessary, not sufficient — _resolve_derived_conflict still verifies
+    per file that the change is one-sided (a both-devices edit, a remote-side redaction, or a
+    local log-line removal fails closed) and re-applies committed local DELETIONS rather than
+    resurrecting the remote copy. Without this set the heal is dead code: _record_sync_commit_push
+    attaches log.md (+ the transcript copy) to every record commit, so the authored-file
+    fail-closed check would abort on every real conflict."""
+    return rel.startswith("journal/") or rel.startswith("transcripts/") or rel == "log.md"
 
 def _clear_ledger_ingested(session_ids):
     """reindex_ledger COALESCEs ingested_at, so an existing row keeps its stamp even after the
@@ -4172,60 +4282,152 @@ def _clear_ledger_ingested(session_ids):
         conn.commit()
 
 def _resolve_derived_conflict(branch):
-    """Heal a rebase conflict confined to DERIVED files. True = healed (HEAD now on top of remote)."""
+    """Heal a rebase conflict confined to DERIVED + re-appliable files. True = healed (HEAD now on
+    top of remote, local journal/transcript/log state re-applied on top). Safety structure:
+    every fail-closed decision — authored files, both-sides edits of the same file, log-line
+    removals — is made BEFORE the destructive reset; a committed local DELETION is re-applied
+    (a purge must never be resurrected from the remote); and any failure AFTER the reset unwinds
+    to the pinned `sync-preconflict` branch, so a half-healed tree (local commits stripped,
+    unvalidated remote content live) can never survive this function."""
+    if _held_or_pending() or git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+        return False   # uncommitted work on disk (held batch / hand-edit) — reset --hard would eat it
     remote = "origin/" + branch
     if git_net("fetch", "origin", branch).returncode != 0:
         return False
-    base = git("merge-base", "HEAD", remote)
-    if base.returncode != 0 or not base.stdout.strip():
+    base_r = git("merge-base", "HEAD", remote)
+    if base_r.returncode != 0 or not base_r.stdout.strip():
         return False
-    diff = git("diff", "--name-only", base.stdout.strip(), "HEAD")
+    base = base_r.stdout.strip()
+    # --no-renames: a journal rename must classify as D+A (deletion re-applied, new path re-applied),
+    # never as an R status the loop below would have to fail closed on.
+    diff = git("diff", "--name-status", "--no-renames", base, "HEAD")
     if diff.returncode != 0:
         return False
-    local = [p for p in diff.stdout.splitlines() if p.strip()]
+    local = []
+    for line in diff.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            local.append((parts[0][:1], parts[-1]))    # (status, rel)
     if not local:
         return False
-    if any(not (p.startswith("journal/") or _is_derived(p)) for p in local):
-        return False        # an authored file is in play — never auto-discard it
-    saved = {}
-    for rel in (p for p in local if p.startswith("journal/")):
-        blob = git("show", "HEAD:" + rel)
-        if blob.returncode == 0:
-            saved[rel] = blob.stdout
-    # Local pages/ content the reset below will replace with the remote's version. Engine folds are
+
+    def _blob(ref, rel):
+        r = git("rev-parse", "%s:%s" % (ref, rel))
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    reapply_txt, reapply_bin, deletions = {}, {}, []
+    local_log_new = []        # lines this device appended to log.md since base
+    for st, rel in local:
+        if _is_derived(rel):
+            continue                                   # remote wins wholesale — logged loudly below
+        if not _is_healable_reapply(rel) or st not in ("A", "M", "D"):
+            return False                               # an authored file is in play — never auto-discard it
+        if rel == "log.md":
+            if st == "D":
+                return False                           # local removed the whole op-log — human call
+            try:   # worktree == HEAD per the clean-tree guard
+                head_lines = (WIKI / "log.md").read_text().splitlines()
+            except OSError:
+                return False
+            base_show = git("show", "%s:log.md" % base)
+            base_lines = base_show.stdout.splitlines() if base_show.returncode == 0 else []
+            head_set = set(head_lines)
+            if any(bl and bl not in head_set for bl in base_lines):
+                return False   # local REMOVED a line (redaction) — an append-only merge would revert it
+            if base_lines and _blob(remote, "log.md") is None:
+                return False   # remote deleted the op-log while local appended — human call
+            base_set = set(base_lines)
+            local_log_new = [ln for ln in head_lines if ln and ln not in base_set]
+            continue
+        # journal/ + transcripts/ are one-file-per-session, but VERIFY single-writer per file
+        # instead of assuming it: a re-redaction rewrites an existing file on another device.
+        if st == "D":
+            deletions.append(rel)      # a committed local purge is RE-APPLIED, never resurrected
+            continue
+        rblob = _blob(remote, rel)
+        if st == "M" and (rblob is None or rblob != _blob(base, rel)):
+            return False   # remote deleted or ALSO changed this file (e.g. re-redaction) — human call
+        if st == "A" and rblob is not None:
+            if rblob != _blob("HEAD", rel):
+                return False           # both devices added the same path with different content
+            continue                                   # identical on both sides — nothing to re-apply
+        # snapshot from the working tree, which the clean-tree guard proved identical to HEAD
+        # (also spares a `git show` per file; transcripts are BINARY gzip, so bytes)
+        try:
+            if rel.startswith("transcripts/"):
+                reapply_bin[rel] = (WIKI / rel).read_bytes()
+            else:
+                reapply_txt[rel] = (WIKI / rel).read_text(errors="surrogateescape")
+        except OSError:
+            return False                               # can't snapshot → refuse BEFORE the reset
+    # Local pages/ content the reset below replaces with the remote's version. Engine folds are
     # reconstructible from the journal, but a HAND-edit to a page (lint fixes, --accept hand-fixes,
-    # Obsidian) is not — so the discard must be LOUD and recoverable, not a log line: name the files
-    # in the committed oplog and point at the sync-preconflict branch that still holds them.
-    lost_pages = [p for p in local if not p.startswith("journal/")]
+    # Obsidian) is not — so the discard must be LOUD and recoverable: named in the committed oplog,
+    # bytes preserved on the sync-preconflict branch.
+    lost_pages = sorted(rel for _st, rel in local if _is_derived(rel))
     git("branch", "-f", "sync-preconflict", "HEAD")   # nothing becomes unreachable
     if git("reset", "--hard", remote).returncode != 0:
         return False
-    sids = []
-    for rel, text in saved.items():
-        p = WIKI / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write(p, _mark_uningested(text))
-        with contextlib.suppress(Exception):
-            sid = parse_frontmatter(text).get("sessionId")
-            if sid:
-                sids.append(sid)
-    if saved:
-        git("add", "--", *sorted(saved))
-        r = _git_commit_rc("sync: re-applied %d local journal entr%s after derived-file conflict"
-                           % (len(saved), "y" if len(saved) == 1 else "ies"))
-        if r.returncode != 0:
-            # Staged-but-uncommitted journal entries must not be reported as healed: the gated push
-            # would publish a history missing them. Fall back to the visible flag-and-proceed path.
-            log("sync: derived-conflict re-apply commit FAILED (%s)"
-                % (r.stderr or r.stdout or "").strip()[:200])
-            return False
+    try:
+        sids = []
+        for rel, text in reapply_txt.items():
+            _atomic_write(WIKI / rel, _mark_uningested(text))
+            with contextlib.suppress(Exception):
+                sid = parse_frontmatter(text).get("sessionId")
+                if sid:
+                    sids.append(sid)
+        for rel, data in reapply_bin.items():
+            _atomic_write(WIKI / rel, data)
+        staged_paths = list(reapply_txt) + list(reapply_bin)
+        for rel in deletions:
+            p = WIKI / rel
+            if p.exists():             # remote still had it → delete again and stage the deletion
+                p.unlink()
+                staged_paths.append(rel)
+        if local_log_new:
+            # keep the remote's log.md and re-append ONLY the lines this device added since base —
+            # lines the remote removed are in base, not in this delta, so a remote redaction of
+            # log.md is never reverted here. Header-then-append via _safe_append, the _oplog pattern.
+            fp = WIKI / "log.md"
+            cur = fp.read_text() if fp.exists() else ""
+            have = set(cur.splitlines())
+            missing = [ln for ln in local_log_new if ln not in have]
+            if missing:
+                if not cur:
+                    _safe_append(fp, OPLOG_HEADER)
+                elif not cur.endswith("\n"):
+                    _safe_append(fp, "\n")
+                _safe_append(fp, "\n".join(missing) + "\n")
+                staged_paths.append("log.md")
+        if lost_pages:
+            # logged BEFORE the commit so the op-log line rides in it and the tree ends clean —
+            # a dirty tracked log.md would wedge every subsequent pull on the clean-tree guard.
+            _oplog("sync", "derived-file conflict: remote version kept for %d local file(s): %s — "
+                   "if any carried a hand-edit, recover it from branch sync-preconflict"
+                   % (len(lost_pages), ", ".join(lost_pages[:6])
+                      + (", …" if len(lost_pages) > 6 else "")))
+            staged_paths.append("log.md")   # deduped by the set() below
+        if staged_paths:
+            if git("add", "-A", "--", *sorted(set(staged_paths))).returncode != 0:
+                raise RuntimeError("git add failed on re-applied paths")
+            if git("diff", "--cached", "--quiet").returncode != 0:   # something actually staged
+                r = _git_commit_rc("sync: re-applied %d local journal entr%s after derived-file conflict"
+                                   % (len(reapply_txt), "y" if len(reapply_txt) == 1 else "ies"))
+                if r.returncode != 0:
+                    raise RuntimeError("re-apply commit failed: %s"
+                                       % (r.stderr or r.stdout or "?").strip()[:200])
+            # byte-identical re-applies stage nothing — that is SUCCESS (remote already has it),
+            # not a failure: the pull must proceed to validation, not soft-fail on a healed tree.
         _clear_ledger_ingested(sids)
-    if lost_pages:
-        _oplog("sync", "derived-file conflict: remote version kept for %d local file(s): %s — "
-               "if any carried a hand-edit, recover it from branch sync-preconflict"
-               % (len(lost_pages), ", ".join(sorted(lost_pages)[:6])
-                  + (", …" if len(lost_pages) > 6 else "")))
-    return True
+        return True
+    except Exception as e:
+        # UNWIND — never leave a half-healed tree behind (local commits stripped from main,
+        # unvalidated remote content live on disk). sync-preconflict pins the exact pre-heal
+        # HEAD, so this restores commits AND working tree; the caller then takes the visible
+        # flag-and-proceed path exactly as if the heal had refused up front.
+        log("sync: heal re-apply FAILED (%s) — unwinding to pre-heal state" % repr(e)[:200])
+        git("reset", "--hard", "sync-preconflict")
+        return False
 
 def _sync_pull():
     """pull --rebase under the git-write lock; on failure abort the rebase, flag it, and PROCEED
@@ -5214,7 +5416,11 @@ def main():
     if cmd == "doctor":   return cmd_doctor(rest)
     if cmd == "sync":     return cmd_sync(rest)
     if cmd == "init":     return cmd_init(rest)
-    if cmd == "index":    regenerate_index(); print("index.md regenerated"); return 0
+    if cmd == "index":
+        if regenerate_index() < 0:   # the quarantine check lives in regenerate_index itself
+            print("index: an ingest batch is staged/held — resolve it first "
+                  "(`wiki ingest --accept` / `--reject`), then re-run."); return 1
+        print("index.md regenerated"); return 0
     if cmd == "reindex":
         n = reindex_ledger()
         print("reindexed", n, "ledger rows from journal"); return 0

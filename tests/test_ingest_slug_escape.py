@@ -124,8 +124,10 @@ W, canary = fresh_wiki()
 block = ("=== FILE: pages/topics/topic-sources.md ===\n"
          "---\nname: A\ndescription: d\ntype: topic\nslug: topic-sources\n"
          "created: 2026-07-19\nupdated: 2026-07-19\nstatus: active\n---\n# A\n\nHIJACKED\n=== END ===\n")
-written = wiki._write_ingest_pages(block, {"pages/topics/topic-sources.md"})   # even if 'allowed'
+written, refused = wiki._write_ingest_pages(block, {"pages/topics/topic-sources.md"})   # even if 'allowed'
 assert written == [], "a model-emitted companion block must be refused: %r" % written
+assert refused == [], "a companion refusal is a guard, not a hold-worthy allowlist refusal: %r" % \
+    [r for r, _ in refused]
 assert (W / "pages" / "topics" / "topic-sources.md").read_text().endswith("ARCHIVE\n"), \
     "the existing companion must be untouched by a refused block"
 print("ok 2c: model-emitted `<slug>-sources` block refused; existing companion untouched (I4)")

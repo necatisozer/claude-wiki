@@ -167,11 +167,15 @@ allowlist = {"pages/topics/keep.md"}                       # locked.md deliberat
 batch = (_file_block("pages/topics/locked.md", "HIJACKED " + BENIGN)          # exists, not allowlisted → REFUSED
          + _file_block("pages/topics/keep.md", "UPDATED " + BENIGN)           # allowlisted overwrite → written
          + _file_block("pages/topics/fresh.md", "NEW " + BENIGN))             # genuinely-new → written
-written = wiki._write_ingest_pages(batch, allowlist)
+written, refused = wiki._write_ingest_pages(batch, allowlist)
 assert written == ["pages/topics/keep.md", "pages/topics/fresh.md"], "batch must complete minus the refused block: %r" % written
 assert locked.read_text() == "ORIGINAL LOCKED CONTENT\n", "out-of-allowlist overwrite must be refused (page untouched)"
 assert "UPDATED" in keep.read_text(), "an allowlisted page must be updated"
 assert (w / "pages" / "topics" / "fresh.md").is_file(), "a genuinely-new page must be written"
+# the refused block's CONTENT is returned to the caller — a refusal must never silently drop the
+# batch facts it carries (the callers stash it + hold the batch for hand-merge)
+assert [r for r, _ in refused] == ["pages/topics/locked.md"], "refusal must be reported: %r" % refused
+assert "HIJACKED" in refused[0][1], "refused block content must be preserved for the stash"
 print("ok 3: out-of-allowlist overwrite refused; allowlisted + new blocks written; batch completes")
 
 # =============================================================================================
@@ -182,13 +186,34 @@ w = _fresh("rg4a_")
 akia = "AKIA" + "B" * 16                                    # AWS-key SHAPE, built by concatenation
 assert wiki.scan_secrets(akia), "sanity: the fake value must be credential-shaped"
 poison = _file_block("pages/topics/leak.md", "For the record the access key is " + akia)
-written = wiki._write_ingest_pages(poison, {"pages/topics/leak.md"})   # even if 'allowed', the secret pass refuses it
+written, refused = wiki._write_ingest_pages(poison, {"pages/topics/leak.md"})   # even if 'allowed', the secret pass refuses it
 assert written == [], "a secret-shaped page must be refused, never written: %r" % written
+assert refused == [], "a secret refusal must NOT be stashed for hand-merge (never persist it): %r" % \
+    [r for r, _ in refused]
 assert not (w / "pages" / "topics" / "leak.md").exists(), "secret-shaped content must never be persisted to disk"
 stage = w / "state" / ".stage"
 assert not (stage.exists() and list(stage.iterdir())), "no staged residue of the refused secret page"
 assert wiki._ingest_hold_reason(poison, cfg), "secret-shaped content must also trip the deterministic hold gate"
 print("ok 4a: runtime-constructed secret-shaped page refused before disk (never persisted, would hold)")
+
+# ---- shared e2e fixture for 4b/4c/4e: ingest config + one un-ingested session + ledger row ----
+def _seed_e2e(w, sid, jrel, title, desc):
+    """Call right after _fresh (wiki.WIKI must point at `w` for ledger())."""
+    (w / "config.json").write_text(json.dumps({"enabled": True,
+        "ingest": {"cron": "* * * * *", "enabled": True, "model": "x", "max_sessions_per_run": 50,
+                   "auto_max_batches": 4}}))
+    (w / jrel).parent.mkdir(parents=True, exist_ok=True)
+    (w / jrel).write_text("---\nname: %s\nsessionId: %s\ndate: 2026-07-06\ningested: false\n---\n"
+                          "# %s\n\n%s.\n" % (title, sid, title, desc))
+    conn = wiki.ledger()                                    # creates the schema in w/state/ledger.db
+    conn.execute("INSERT INTO sessions(session_id, project, page_path, summarized_at, summarized_by, "
+                 "date, title, description) VALUES(?,?,?,?,?,?,?,?)",
+                 (sid, "apigw", jrel, "2026-07-06T09:00:00", "haiku", "2026-07-06", title, desc))
+    conn.commit(); conn.close()
+
+def _commit_all(w, msg):
+    subprocess.run(["git", "-C", str(w), "add", "-A"], capture_output=True)
+    subprocess.run(["git", "-C", str(w), "commit", "-q", "-m", msg], capture_output=True)
 
 # =============================================================================================
 # 4b. END-TO-END through the AUTO-INGEST path with a fake `claude` on PATH: a booby-trapped
@@ -196,18 +221,9 @@ print("ok 4a: runtime-constructed secret-shaped page refused before disk (never 
 #     page — even though the model's SUMMARY self-reports `hard_contradiction: none`.
 # =============================================================================================
 we = _fresh("rg4b_", git=True)
-(we / "config.json").write_text(json.dumps({"enabled": True,
-    "ingest": {"cron": "* * * * *", "enabled": True, "model": "x", "max_sessions_per_run": 50, "auto_max_batches": 4}}))
-jrel = "journal/2026/07/entry.md"
-(we / "journal" / "2026" / "07").mkdir(parents=True, exist_ok=True)   # _fresh pre-seeds journal/ (v0.1.8)
-(we / jrel).write_text("---\nname: Session\nsessionId: deadbeef-1a1a-4003-9abc-000000000003\n"
-                       "date: 2026-07-06\ningested: false\n---\n# Session\n\nwired the gateway.\n")
 SID = "deadbeef-1a1a-4003-9abc-000000000003"
-conn = wiki.ledger()                                        # creates the schema in we/state/ledger.db
-conn.execute("INSERT INTO sessions(session_id, project, page_path, summarized_at, summarized_by, date, "
-             "title, description) VALUES(?,?,?,?,?,?,?,?)",
-             (SID, "apigw", jrel, "2026-07-06T09:00:00", "haiku", "2026-07-06", "Session", "wired the gateway"))
-conn.commit(); conn.close()
+jrel = "journal/2026/07/entry.md"
+_seed_e2e(we, SID, jrel, "Session", "wired the gateway")
 
 fake = _mkdtemp("rg4b_fake_")
 result_file = fake / "ing_out.md"
@@ -251,5 +267,111 @@ ingested_at = db.execute("SELECT ingested_at FROM sessions WHERE session_id=?", 
 db.close()
 assert ingested_at is None, "a held batch must not mark its sessions ingested: %r" % ingested_at
 print("ok 4b: auto-ingest HELD a booby-trapped block (model said 'none'); never committed live")
+
+# =============================================================================================
+# 4c. SILENT-FACT-LOSS guard — the fold re-emits an EXISTING page outside the phase-1 selection.
+#     The blind overwrite is refused, but the batch must NOT commit-and-mark-ingested anyway
+#     (that would drop the refused block's facts forever): it is HELD, the block's content is
+#     stashed in state/ingest-refused.md for hand-merge, the existing page is untouched, and
+#     index.md is NOT regenerated from the unreviewed staged tree (quarantine leak).
+# =============================================================================================
+wc = _fresh("rg4c_", git=True)
+locked_rel = "pages/topics/locked.md"
+(wc / locked_rel).write_text("---\nname: Locked\ndescription: original locked page\ntype: topic\n"
+                             "slug: locked\ncreated: 2026-07-01\nupdated: 2026-07-01\nstatus: active\n"
+                             "---\n# Locked\n\nORIGINAL LOCKED CONTENT\n")
+_commit_all(wc, "seed locked page")
+SID_C = "deadbeef-2b2b-4004-9abc-000000000004"
+jrel_c = "journal/2026/07/entry-c.md"
+_seed_e2e(wc, SID_C, jrel_c, "Session C", "locked work")
+
+result_file_c = fake / "ing_out_c.md"   # reuse the 4b fake claude; only the result payload changes
+result_file_c.write_text(
+    # benign body (passes the risk gate) aimed at the EXISTING page phase-1 did NOT select
+    "=== FILE: pages/topics/locked.md ===\n"
+    "---\nname: Locked\ndescription: rewritten\ntype: topic\nslug: locked\n"
+    "created: 2026-07-01\nupdated: 2026-07-06\nstatus: active\n---\n"
+    "# Locked\n\n" + BENIGN + " OVERWRITE-ATTEMPT\n\n"
+    "## Sources\n- 2026-07-06 · deadbeef · crafted\n"
+    "=== END ===\n"
+    "=== SUMMARY ===\ncreated: none\nupdated: locked\nhard_contradiction: none\n")
+env_c = {**env, "WIKI_HOME": str(wc), "FAKE_CLAUDE_RESULT_FILE": str(result_file_c)}
+r = subprocess.run([sys.executable, str(ENGINE), "ingest", "--if-due"], capture_output=True, text=True, env=env_c)
+assert r.returncode == 0, r.stdout + r.stderr
+held = (wc / "state" / "ingest_held")
+assert held.exists() and "outside the phase-1 selection" in held.read_text(), \
+    "an out-of-allowlist re-emit must HOLD the batch, not silently drop the block: %r" % \
+    (held.read_text() if held.exists() else "<no hold>")
+assert "ORIGINAL LOCKED CONTENT" in (wc / locked_rel).read_text(), \
+    "the unselected existing page must be untouched"
+stash = wc / "state" / "ingest-refused.md"
+assert stash.exists() and "OVERWRITE-ATTEMPT" in stash.read_text(), \
+    "the refused block's content must be stashed for hand-merge, never dropped"
+db = sqlite3.connect(str(wc / "state" / "ledger.db"))
+ing = db.execute("SELECT ingested_at FROM sessions WHERE session_id=?", (SID_C,)).fetchone()[0]
+db.close()
+assert ing is None, "a refusal-held batch must not mark its sessions ingested: %r" % ing
+assert "ingested: false" in (wc / jrel_c).read_text(), "journal flag must not be flipped on a held batch"
+idx = wc / "index.md"
+assert not (idx.exists() and "rewritten" in idx.read_text()), \
+    "index.md must NOT be regenerated from unreviewed staged pages (quarantine leak)"
+print("ok 4c: out-of-selection re-emit → held + stashed; nothing marked ingested, index untouched")
+
+# =============================================================================================
+# 4d. The refused-block STASH itself: (a) secret-shaped spans are MASKED before persisting (the
+#     "never persisted unmasked" invariant covers the stash too); (b) a later batch's refusal
+#     APPENDS — it must never clobber an earlier batch's un-merged facts.
+# =============================================================================================
+wd = _fresh("rg4d_")
+_akia2 = "AKIA" + "D" * 16
+wiki._stash_refused_blocks([("pages/topics/first.md", "the recorded key was " + _akia2 + "\n")])
+stash1 = (wd / "state" / "ingest-refused.md").read_text()
+assert _akia2 not in stash1, "stash must MASK secret-shaped content, never persist it raw"
+assert "first.md" in stash1 and "the recorded key was" in stash1, "non-secret facts must survive masking"
+wiki._stash_refused_blocks([("pages/topics/second.md", "second batch facts worth keeping\n")])
+stash2 = (wd / "state" / "ingest-refused.md").read_text()
+assert "first.md" in stash2 and "the recorded key was" in stash2, \
+    "a later batch's refusal must APPEND, not clobber the earlier un-merged stash"
+assert "second batch facts worth keeping" in stash2, "the new batch's blocks must be stashed too"
+print("ok 4d: stash masks secrets and appends across batches (no clobber)")
+
+# =============================================================================================
+# 4e. MANUAL ingest whose fold produced ONLY refused blocks (nothing written) must HOLD, not
+#     release: releasing would let the daily auto-ingest immediately re-fold the same sessions
+#     and overwrite the stash underneath the user mid-hand-merge.
+# =============================================================================================
+we2 = _fresh("rg4e_", git=True)
+locked2_rel = "pages/topics/locked2.md"
+(we2 / locked2_rel).write_text("---\nname: Locked2\ndescription: original\ntype: topic\nslug: locked2\n"
+                               "created: 2026-07-01\nupdated: 2026-07-01\nstatus: active\n---\n"
+                               "# Locked2\n\nORIGINAL\n")
+_commit_all(we2, "seed")
+SID_E = "deadbeef-3c3c-4005-9abc-000000000005"
+jrel_e = "journal/2026/07/entry-e.md"
+_seed_e2e(we2, SID_E, jrel_e, "Session E", "locked2 work")
+result_file_e = fake / "ing_out_e.md"
+result_file_e.write_text(   # ONLY an out-of-selection re-emit — nothing writable in the batch
+    "=== FILE: pages/topics/locked2.md ===\n"
+    "---\nname: Locked2\ndescription: rewritten\ntype: topic\nslug: locked2\n"
+    "created: 2026-07-01\nupdated: 2026-07-06\nstatus: active\n---\n"
+    "# Locked2\n\n" + BENIGN + " ONLY-REFUSED-CONTENT\n\n"
+    "## Sources\n- 2026-07-06 · deadbeef · crafted\n"
+    "=== END ===\n=== SUMMARY ===\ncreated: none\nupdated: locked2\nhard_contradiction: none\n")
+env_e = {**env, "WIKI_HOME": str(we2), "FAKE_CLAUDE_RESULT_FILE": str(result_file_e)}
+r = subprocess.run([sys.executable, str(ENGINE), "ingest"], capture_output=True, text=True, env=env_e)
+assert r.returncode == 1, "a refused-only manual batch must exit nonzero for attention: " + r.stdout + r.stderr
+assert (we2 / "state" / "pending_ingest.json").exists(), \
+    "a refused-only manual batch must STAY staged (releasing lets cron re-fold + clobber the stash)"
+assert (we2 / "state" / "ingest_held").exists() and \
+       "outside the phase-1 selection" in (we2 / "state" / "ingest_held").read_text(), \
+    "a refused-only manual batch must be HELD"
+assert "ONLY-REFUSED-CONTENT" in (we2 / "state" / "ingest-refused.md").read_text(), \
+    "the refused block must be stashed"
+# and the pending flag actually blocks the daily auto-run (the stash cannot be clobbered under the user)
+r = subprocess.run([sys.executable, str(ENGINE), "ingest", "--if-due"], capture_output=True, text=True, env=env_e)
+assert r.returncode == 0, r.stdout + r.stderr
+assert "ONLY-REFUSED-CONTENT" in (we2 / "state" / "ingest-refused.md").read_text(), \
+    "a blocked auto-run must leave the stash untouched"
+print("ok 4e: refused-only manual batch HOLDs; pending gate keeps cron off the stash")
 
 print("PASS test_risk_gate")

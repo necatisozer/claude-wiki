@@ -5,6 +5,54 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The v0.1.13 derived-conflict auto-heal was dead code in production.**
+  `log.md` rides in every record/ingest/retention commit and the synced
+  transcript copy rides in every record commit, so the heal's authored-file
+  fail-closed check aborted on every real multi-device conflict — the device
+  stayed diverged and every push failed, exactly the wedge the heal was built
+  to remove. Journal entries, transcript copies (byte-exact — they are gzip),
+  and the op-log lines this device added since the merge base are now
+  re-applied on top of the remote — with per-file one-sidedness verified, not
+  assumed: a both-devices edit of the same file (e.g. a remote re-redaction), a
+  local log-line removal, or any authored file still fails closed; a committed
+  local DELETION is re-applied, never resurrected from the remote. The heal
+  refuses to run over uncommitted work (a held batch, an in-progress
+  hand-edit), makes every fail-closed decision before the destructive reset,
+  and unwinds to the pinned `sync-preconflict` branch on any post-reset
+  failure, so a half-healed tree (local commits stripped, unvalidated remote
+  content live) can no longer survive it.
+- **A fold block aimed at an existing page outside the phase-1 selection no
+  longer loses its facts silently.** The overwrite was correctly refused, but
+  the batch still committed and marked its sessions `ingested`, dropping the
+  refused block's content forever. The batch is now HELD (on the manual path
+  too, even when nothing else was written), the block is stashed in
+  `state/ingest-refused.md` for hand-merge — secret-shaped spans masked, later
+  batches appending rather than clobbering an un-merged stash — and the ingest
+  prompt now tells the fold model the page list is partial and to never
+  re-emit a page it wasn't given.
+- **Held-batch quarantine bypasses closed.** (1) `index.md` is no longer
+  regenerated from the unreviewed working tree while a batch is staged/held —
+  live sessions Read `index.md` directly, so staged page descriptions leaked
+  around the committed-HEAD quarantine; `--accept` rebuilds it after review.
+  (2) The pending/held flags are written BEFORE risk-gated pages hit disk, so
+  a crash mid-stage can no longer leave held content live. (3) The LLM lint
+  report is defanged (`_inert_report`: URLs + tool-call shapes) before landing
+  in `lint-report.md` — previously the one LLM output path written unsanitized.
+- **`install.sh` now honors a real TTY.** SECURITY.md/README promised that
+  downloading and running the installer locally allows interactive confirms,
+  but `--yes` was unconditional; it is now passed only when stdin is not a
+  terminal. Unattended automation that allocates a pty (`ssh -t`, CI wrappers)
+  sets `WIKI_INSTALL_YES=1` to force `--yes`.
+- **Docs pointed at a dead installer.** SKILL.md's "New machine?" line and
+  SECURITY.md's inspect-then-run example pinned `v0.1.0/install.sh`, whose
+  exact-version gate hard-fails against the current marketplace; both now track
+  the current release, and CONTRIBUTING.md documents the release-time sweep of
+  every pinned URL.
+
 ## [0.1.17] - 2026-08-03
 
 The hardening release: a high-effort adversarially-verified review of the whole

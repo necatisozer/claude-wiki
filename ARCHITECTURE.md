@@ -127,8 +127,10 @@ the engine**; **stage-then-promote every write**. Concretely:
   `--tools "" --disable-slash-commands --strict-mcp-config --no-session-persistence`, so a poisoned
   transcript **cannot make the engine act** — the blast radius is bounded to the content it writes.
 - **Passive-memory digest sandbox.** Recalled text is inert-quoted: URLs → `[link removed]`, tool-call
-  shapes stripped, code fences demoted, leading imperatives tagged `[inert]`. The digest reads
-  **committed HEAD only**, so an uncommitted/held page never reaches a live session.
+  shapes stripped, code fences demoted, leading imperatives tagged `[inert]`; the LLM lint report gets
+  the same URL/tool-call defang before landing in `lint-report.md`. While an ingest batch is
+  staged/held, digest and query read pages from **committed HEAD** — and `index.md` is not regenerated
+  until the batch is reviewed — so an unreviewed/held page never reaches a live session.
 - **Deterministic risk-gated auto-accept.** `ingest.mode: auto` (default) folds under an
   engine-computed hold: a batch that overwrites a tracked page, exceeds the diff cap, or carries a
   risky shape (imperative / 2nd-person / URL / secret / PII) is HELD (staged, uncommitted) for review.

@@ -35,6 +35,15 @@ tests shim or skip all three, so the suite must pass in a bare environment.
   niceties — see [ARCHITECTURE.md](ARCHITECTURE.md). Preserve them; if a change touches one, say so
   explicitly in the PR.
 
+## Cutting a release
+
+The installer refuses any marketplace copy whose version differs from its own pinned `EXPECT`, so every
+pinned version string must move together in the release commit: `EXPECT` in `install.sh`, `version` in
+`.claude-plugin/plugin.json`, the `CHANGELOG.md` entry, and **every** `raw.githubusercontent.com/...`
+`/vX.Y.Z/install.sh` URL — currently in `README.md`, `SECURITY.md`, and `skills/wiki/SKILL.md`
+(`grep -rn 'install.sh' *.md skills/` to catch them all). A doc left pinned to an old tag points users
+at an installer that hard-fails its version gate.
+
 ## Where things live
 
 - `bin/wiki` — the engine (command dispatch is at the bottom, in `main()`).
