@@ -106,6 +106,17 @@ deterministic** (never a model-emitted field), and every LLM boundary treats tra
 **untrusted data** fenced in a per-call sentinel. There is **no MCP server and no embedding/semantic
 layer** — search is keyword-only. Full detail: [ARCHITECTURE.md](ARCHITECTURE.md).
 
+### Browsing your memory in Obsidian (optional)
+
+The pages are plain markdown with `[[wikilinks]]`, so `~/.claude/wiki/pages/` is already a valid
+[Obsidian](https://obsidian.md) vault — open that folder ("Open folder as vault") and you get the
+knowledge graph, backlink panes, and full-text search over exactly the human-facing layer, zero
+configuration. Root the vault at `pages/` (not the wiki root) so the journal, prompts, and engine
+files stay out of view; the engine's required gitignore already covers Obsidian's `.obsidian/`
+workspace files and `.trash/` at any depth, so vault state never enters the synced repo. Hand-edits
+are fine — you are the curator, and ingest commits only its own exact paths — but avoid editing
+while a scheduled ingest is running.
+
 ## Permission setup (recommended — copy 4 rules)
 
 For the recall surfaces to run **prompt-free**, Claude needs read-only auto-allow for the wiki's read
