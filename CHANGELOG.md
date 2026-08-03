@@ -5,6 +5,79 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.17] - 2026-08-03
+
+The hardening release: a high-effort adversarially-verified review of the whole
+engine confirmed ten defects — durable-state ordering bugs that silently strand
+or lose recorded knowledge, gaps where unreviewed content could reach a live
+session, and two packaging breaks — all fixed here, followed by a four-angle
+cleanup sweep that collapsed the duplication the fixes exposed.
+
+### Fixed
+
+- **A resumed session that now skips/rejects no longer clobbers its ledger
+  row.** `_record_skip` used INSERT OR REPLACE, so a transcript that grew into
+  a classifier skip nulled the prior good row's `page_path`/`ingested_at` —
+  orphaning a journal entry that was still on disk and cited. It now UPDATEs
+  in place (like the error path always did): provenance survives, only
+  status/skip_reason/mtime advance.
+- **A failed ingest commit reverts the durable `ingested:` flags.** Both the
+  auto batch and `ingest --accept` flipped journal frontmatter to
+  `ingested: true` *before* committing; on commit failure the flips stayed on
+  disk, the next `reindex` seeded `ingested_at` from them, and the promised
+  retry never ran — the batch's knowledge never reached committed pages. Flags
+  now roll back whenever the commit fails.
+- **`wiki query` honors the held-ingest quarantine.** While a batch was HELD,
+  the FTS index read staged (possibly attacker-poisoned) pages from the
+  working tree — bypassing the committed-HEAD-only rule the digest already
+  enforced. Both readers now share one quarantine (`_quarantined_page_read`):
+  held → committed HEAD, new-and-uncommitted → skipped.
+- **Risky-shaped journal snippets are withheld from query output.** Journal
+  bodies never pass a review gate (pages do), so `--include-journal` could
+  serve an injection-shaped payload into a live session before ingest's hold
+  ever fired. A hit whose entry carries risky shapes keeps its path + title
+  but the snippet is replaced with a content-free class list.
+- **Lint's secret net re-includes the `high_entropy` backstop.** It was
+  narrowed in 0.1.2 to dodge false positives that 0.1.11's
+  `_looks_like_code_identifier` later fixed structurally — but lint was never
+  re-widened, leaving the weekly sweep (the only retroactive scan over content
+  already on the remote) blind to unknown-provider credentials.
+- **Lint's injection net covers the ingest gate's combo shapes.** Override
+  clauses, attack verbs (curl/wget/exfiltrate) and the imperative+URL exfil
+  combo now tag as `injection` over already-landed content, so a poisoned page
+  that entered outside the record/ingest path (restored repo, hand edit) is
+  surfaced. imperative+2nd-person stays write-gate-only — ordinary prose
+  addressed to the reader trips it.
+- **The derived-conflict auto-heal is loud and checked.** Its re-apply commit
+  now injects the fallback git identity and verifies the return code (a silent
+  failure used to report "auto-resolved" while journal entries sat
+  uncommitted), and any local pages/ content replaced by the remote is named
+  in the committed oplog with a pointer to the `sync-preconflict` recovery
+  branch — a hand-edit can no longer vanish with only a debug log line.
+- **`install.sh` honors `CLAUDE_CONFIG_DIR`.** The manifest and engine paths
+  were hardcoded to `$HOME/.claude`, so a relocated config dir hard-failed the
+  installer at the version gate.
+- **Prompt-free recall works again.** `/wiki` invoked the engine via
+  `${CLAUDE_PLUGIN_ROOT}` (the version-keyed plugin cache), which the shipped
+  allow-rules never matched — every query prompted. The command now runs the
+  marketplace path the rules grant (cache path kept as dev fallback), and a
+  new parity test pins the path contract across `commands/wiki.md`,
+  `settings.json`, and `install.sh` so drift breaks CI instead of recall.
+
+### Changed
+
+- **Duplication collapsed into single homes** (4-angle cleanup sweep): the
+  held-page quarantine, the `ingested:` frontmatter rewrite, secret detection
+  (`_iter_secret_matches` everywhere, including the retro-scrub), the
+  `claude -p` argv/envelope contract (doctor now probes the exact production
+  invocation), the commit primitive, gh url/create resolution, non-blocking
+  job locks, state stamps, tool-result text extraction, and the un-ingested
+  rows query. Also: lint scans secrets once per document instead of twice,
+  the ingest hold gate spawns one git subprocess per block instead of three,
+  cron specs parse once per walk instead of per probed minute, and ~115
+  phantom-nested lines plus dead code (`git_commit`, `_head_page_text`,
+  unused params) are gone. No behavior changes intended.
+
 ## [0.1.16] - 2026-08-03
 
 The gist-alignment release: a live divergence hunt against the running system
