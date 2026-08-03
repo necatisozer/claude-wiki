@@ -37,7 +37,7 @@ no-op when WIKI_ENGINE is set, so the engine never self-records or self-injects.
 trust boundaries, and the config reference: see ARCHITECTURE.md (in the plugin repo).
 """
 
-import sys, os, json, re, sqlite3, subprocess, glob, contextlib, difflib, shlex, unicodedata
+import sys, os, json, re, sqlite3, subprocess, glob, contextlib, difflib, functools, shlex, unicodedata
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -60,7 +60,7 @@ os.environ["GIT_ALLOW_PROTOCOL"] = "https:ssh:file"
 DROP_TYPES = {
     "attachment", "system", "mode", "permission-mode", "last-prompt",
     "file-history-snapshot", "queue-operation", "bridge-session", "summary",
-    "tool_reference", "direct", "ai-title", "tools_changed", "plan_mode",
+    "tool_reference", "direct", "tools_changed", "plan_mode",
     # 2026-07 transcript-format additions (all non-content metadata; shapes verified against live
     # transcripts): per-file backup deltas, agent config, worktree/session bookkeeping, UI frame links.
     "file-history-delta", "agent-setting", "worktree-state", "relocated", "frame-link",
@@ -171,6 +171,26 @@ def file_lock(path):
     finally:
         try: fcntl.flock(f, fcntl.LOCK_UN)
         finally: f.close()
+
+@contextlib.contextmanager
+def _job_lock(name):
+    """NON-BLOCKING job lock under state/ (vs file_lock, which blocks). Yields True when acquired,
+    False when another process holds it — callers no-op then (one runner per job at a time)."""
+    import fcntl
+    (WIKI / "state").mkdir(parents=True, exist_ok=True)
+    f = open(WIKI / "state" / name, "w")
+    try:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except Exception:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    finally:
+        f.close()
 
 # ---------------------------------------------------------------- safe write path (WP1 ROW 1)
 # EVERY engine write (pages, journal, digest, config, flags, staged/held content) routes through
@@ -527,7 +547,10 @@ def keyarg(name, inp):
             return v
     return ""
 
-def result_head(res, tur, is_err):
+def _tool_result_text(res, tur):
+    """Best-effort text of a tool_result: content str, list-of-dicts text join, then the
+    toolUseResult's stdout/stderr, then its str form. Single home for the extraction so
+    result rendering and recall hit/miss classification can never diverge."""
     text = ""
     if isinstance(res, str):
         text = res
@@ -537,7 +560,10 @@ def result_head(res, tur, is_err):
         text = tur.get("stdout") or tur.get("stderr") or ""
     elif not text and isinstance(tur, str):
         text = tur
-    text = (text or "").strip()
+    return (text or "").strip()
+
+def result_head(res, tur, is_err):
+    text = _tool_result_text(res, tur)
     first = next((ln for ln in text.splitlines() if ln.strip()), "")
     # base64 / long no-space blob
     if first and len(first) > 80 and " " not in first[:80]:
@@ -634,16 +660,7 @@ def _recall_result_hit(res, tur, is_err):
     (errored / interrupted / empty). Only confirmed values are ever counted downstream."""
     if is_err:
         return None
-    text = ""
-    if isinstance(res, str):
-        text = res
-    elif isinstance(res, list):
-        text = " ".join(x.get("text", "") for x in res if isinstance(x, dict))
-    if not text and isinstance(tur, dict):
-        text = tur.get("stdout") or tur.get("stderr") or ""
-    elif not text and isinstance(tur, str):
-        text = tur
-    text = (text or "").strip()
+    text = _tool_result_text(res, tur)
     if not text:
         return None
     if text.startswith("no matches for") or text == "[]":
@@ -656,11 +673,12 @@ def clean_transcript(path):
               "started": None, "ended": None, "models": set(),
               "tool_counts": {}, "files_touched": set(), "subagents": 0, "recall": []}
     out = []
-    _acc = [0]       # running char total → bound accumulation (a session of millions of msgs can't OOM)
+    _acc = 0         # running char total → bound accumulation (a session of millions of msgs can't OOM)
     def add(line):
-        if _acc[0] < CFG_MAX_TRANSCRIPT:
+        nonlocal _acc
+        if _acc < CFG_MAX_TRANSCRIPT:
             out.append(line)
-            _acc[0] += len(line) + 1
+            _acc += len(line) + 1
     pending = {}     # tool_use_id -> (name, input)
     recall_q = {}    # tool_use_id -> the pending recall event awaiting its hit/miss result (v0.1.10)
     stats = {"user_prompts": 0, "assistant_texts": 0, "edits": 0, "commits": 0,
@@ -678,113 +696,113 @@ def clean_transcript(path):
         add("  • %s: %s → \"%s\"" % (name, ka, result_head(res, tur, is_err)))
 
     for raw in _bounded_lines(path):      # per-line cap → a monster JSONL line can't OOM the reader
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                obj = json.loads(raw)
-            except Exception:
-                continue
-            t = obj.get("type")
-            # harvest common fields
-            header["sessionId"] = header["sessionId"] or obj.get("sessionId")
-            if obj.get("cwd"):
-                header["cwd"] = obj.get("cwd")
-            b = obj.get("gitBranch")
-            if b and b not in ("HEAD", ""):
-                header["branch"] = b
-            ts = obj.get("timestamp")
-            if ts:
-                header["started"] = header["started"] or ts
-                header["ended"] = ts
-            if t == "ai-title":
-                header["title"] = obj.get("aiTitle") or header["title"]
-                continue
-            if t == "agent-name":
-                # background/agent sessions get their name here; an aiTitle, when present, wins
-                # (the ai-title branch above overrides a title this set).
-                header["title"] = header["title"] or obj.get("agentName")
-                continue
-            if t == "pr-link":
-                # session↔PR association — recordable signal. Emit repo#number ONLY, never prUrl:
-                # a URL here would ride record → journal → ingest into a page and trip the risk
-                # gate's URL hold on otherwise-clean content.
-                repo, num = obj.get("prRepository"), obj.get("prNumber")
-                if repo and num:
-                    add("PR: %s#%s" % (truncate(str(repo), 80), truncate(str(num), 12)))
-                continue
-            if t in DROP_TYPES:
-                continue
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        t = obj.get("type")
+        # harvest common fields
+        header["sessionId"] = header["sessionId"] or obj.get("sessionId")
+        if obj.get("cwd"):
+            header["cwd"] = obj.get("cwd")
+        b = obj.get("gitBranch")
+        if b and b not in ("HEAD", ""):
+            header["branch"] = b
+        ts = obj.get("timestamp")
+        if ts:
+            header["started"] = header["started"] or ts
+            header["ended"] = ts
+        if t == "ai-title":
+            header["title"] = obj.get("aiTitle") or header["title"]
+            continue
+        if t == "agent-name":
+            # background/agent sessions get their name here; an aiTitle, when present, wins
+            # (the ai-title branch above overrides a title this set).
+            header["title"] = header["title"] or obj.get("agentName")
+            continue
+        if t == "pr-link":
+            # session↔PR association — recordable signal. Emit repo#number ONLY, never prUrl:
+            # a URL here would ride record → journal → ingest into a page and trip the risk
+            # gate's URL hold on otherwise-clean content.
+            repo, num = obj.get("prRepository"), obj.get("prNumber")
+            if repo and num:
+                add("PR: %s#%s" % (truncate(str(repo), 80), truncate(str(num), 12)))
+            continue
+        if t in DROP_TYPES:
+            continue
 
-            msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
-            role = "user" if t == "user" else "assistant" if t == "assistant" else msg.get("role")
-            if role not in ("user", "assistant"):
-                if t:
-                    stats["unknown_types"].add(t)
-                continue
-            stats["messages"] += 1
-            content = msg.get("content")
-            tur = obj.get("toolUseResult")
+        msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+        role = "user" if t == "user" else "assistant" if t == "assistant" else msg.get("role")
+        if role not in ("user", "assistant"):
+            if t:
+                stats["unknown_types"].add(t)
+            continue
+        stats["messages"] += 1
+        content = msg.get("content")
+        tur = obj.get("toolUseResult")
 
-            if role == "user":
-                # tool-result carrier?
-                if isinstance(content, list) and any(
-                        isinstance(it, dict) and it.get("type") == "tool_result" for it in content):
-                    for it in content:
-                        if isinstance(it, dict) and it.get("type") == "tool_result":
-                            emit_tool(it.get("tool_use_id"), it.get("content"), tur, it.get("is_error"))
+        if role == "user":
+            # tool-result carrier?
+            if isinstance(content, list) and any(
+                    isinstance(it, dict) and it.get("type") == "tool_result" for it in content):
+                for it in content:
+                    if isinstance(it, dict) and it.get("type") == "tool_result":
+                        emit_tool(it.get("tool_use_id"), it.get("content"), tur, it.get("is_error"))
+                continue
+            if isinstance(content, list):
+                text = " ".join(x.get("text", "") for x in content
+                                if isinstance(x, dict) and x.get("type") == "text").strip()
+            elif isinstance(content, str):
+                text = content.strip()
+            else:
+                text = ""
+            if not text:
+                continue
+            if text.startswith("[Request interrupted") or text.startswith("<command-") \
+                    or text.startswith("Caveat:"):
+                continue
+            add("USER: " + truncate(text, CFG_USER))
+            stats["user_prompts"] += 1
+        else:  # assistant
+            if msg.get("model"):
+                header["models"].add(msg.get("model"))
+            items = content if isinstance(content, list) else []
+            for it in items:
+                if not isinstance(it, dict):
                     continue
-                if isinstance(content, list):
-                    text = " ".join(x.get("text", "") for x in content
-                                    if isinstance(x, dict) and x.get("type") == "text").strip()
-                elif isinstance(content, str):
-                    text = content.strip()
-                else:
-                    text = ""
-                if not text:
+                ct = it.get("type")
+                if ct == "text":
+                    tx = (it.get("text") or "").strip()
+                    if tx:
+                        add("ASSISTANT: " + truncate(tx, CFG_ASST))
+                        stats["assistant_texts"] += 1
+                elif ct == "thinking":
                     continue
-                if text.startswith("[Request interrupted") or text.startswith("<command-") \
-                        or text.startswith("Caveat:"):
-                    continue
-                add("USER: " + truncate(text, CFG_USER))
-                stats["user_prompts"] += 1
-            else:  # assistant
-                if msg.get("model"):
-                    header["models"].add(msg.get("model"))
-                items = content if isinstance(content, list) else []
-                for it in items:
-                    if not isinstance(it, dict):
-                        continue
-                    ct = it.get("type")
-                    if ct == "text":
-                        tx = (it.get("text") or "").strip()
-                        if tx:
-                            add("ASSISTANT: " + truncate(tx, CFG_ASST))
-                            stats["assistant_texts"] += 1
-                    elif ct == "thinking":
-                        continue
-                    elif ct == "tool_use":
-                        nm = it.get("name"); inp = it.get("input") or {}
-                        header["tool_counts"][nm] = header["tool_counts"].get(nm, 0) + 1
-                        if nm in ("Edit", "Write", "MultiEdit"):
-                            stats["edits"] += 1
-                            fp = inp.get("file_path")
-                            if fp: header["files_touched"].add(fp)
-                        elif nm == "Bash" and "git commit" in str(inp.get("command", "")):
-                            stats["commits"] += 1
-                        # v0.1.10 — recall capture (Phase A): engine-computed, capped, sanitized.
-                        if len(header["recall"]) < _RECALL_CAP:
-                            if nm == "Bash":
-                                term = _recall_query_term(inp.get("command"))
-                                if term is not None:
-                                    ev = {"q": term, "hit": None}
-                                    header["recall"].append(ev)
-                                    recall_q[it.get("id")] = ev
-                            elif nm in ("Read", "Grep", "Glob"):
-                                rel = _recall_wiki_rel(inp.get("file_path") or inp.get("path"))
-                                if rel and not any(e.get("read") == rel for e in header["recall"]):
-                                    header["recall"].append({"read": rel})
-                        pending[it.get("id")] = (nm, inp)
+                elif ct == "tool_use":
+                    nm = it.get("name"); inp = it.get("input") or {}
+                    header["tool_counts"][nm] = header["tool_counts"].get(nm, 0) + 1
+                    if nm in ("Edit", "Write", "MultiEdit"):
+                        stats["edits"] += 1
+                        fp = inp.get("file_path")
+                        if fp: header["files_touched"].add(fp)
+                    elif nm == "Bash" and "git commit" in str(inp.get("command", "")):
+                        stats["commits"] += 1
+                    # v0.1.10 — recall capture (Phase A): engine-computed, capped, sanitized.
+                    if len(header["recall"]) < _RECALL_CAP:
+                        if nm == "Bash":
+                            term = _recall_query_term(inp.get("command"))
+                            if term is not None:
+                                ev = {"q": term, "hit": None}
+                                header["recall"].append(ev)
+                                recall_q[it.get("id")] = ev
+                        elif nm in ("Read", "Grep", "Glob"):
+                            rel = _recall_wiki_rel(inp.get("file_path") or inp.get("path"))
+                            if rel and not any(e.get("read") == rel for e in header["recall"]):
+                                header["recall"].append({"read": rel})
+                    pending[it.get("id")] = (nm, inp)
 
     # fold subagents (final report only)
     sid = header["sessionId"]
@@ -808,21 +826,21 @@ def subagent_final(path):
     last_text = ""
     task = ""
     for raw in _bounded_lines(path):
-            raw = raw.strip()
-            if not raw:
-                continue
-            try: obj = json.loads(raw)
-            except Exception: continue
-            msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
-            role = "user" if obj.get("type") == "user" else "assistant" if obj.get("type") == "assistant" else msg.get("role")
-            content = msg.get("content")
-            if role == "user" and not task:
-                if isinstance(content, str):
-                    task = content.strip()
-            elif role == "assistant" and isinstance(content, list):
-                for it in content:
-                    if isinstance(it, dict) and it.get("type") == "text" and it.get("text", "").strip():
-                        last_text = it["text"].strip()
+        raw = raw.strip()
+        if not raw:
+            continue
+        try: obj = json.loads(raw)
+        except Exception: continue
+        msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+        role = "user" if obj.get("type") == "user" else "assistant" if obj.get("type") == "assistant" else msg.get("role")
+        content = msg.get("content")
+        if role == "user" and not task:
+            if isinstance(content, str):
+                task = content.strip()
+        elif role == "assistant" and isinstance(content, list):
+            for it in content:
+                if isinstance(it, dict) and it.get("type") == "text" and it.get("text", "").strip():
+                    last_text = it["text"].strip()
     return (task[:60] + " → " if task else "") + last_text
 
 # ---------------------------------------------------------------- LLM boundary (WP1 ROW 1)
@@ -863,22 +881,31 @@ def _frame_untrusted(system_prompt, user_text):
     return system_prompt + guard, "%s\n%s\n%s" % (begin, user_text, end), token
 
 # ---------------------------------------------------------------- claude -p (lean)
+def _claude_argv(model, system_prompt):
+    """The exact `claude -p` invocation contract — ONE home, shared by call_claude and doctor's
+    _claude_contract_check so the probe always tests the production invocation, never a drifted copy."""
+    return ["claude", "-p", "--model", model,
+            "--no-session-persistence", "--tools", "",
+            "--disable-slash-commands", "--strict-mcp-config",
+            "--system-prompt", system_prompt, "--output-format", "json"]
+
+def _parse_claude_envelope(stdout):
+    """Last JSON-object line of `claude -p --output-format json` output, or None."""
+    obj = None
+    for ln in stdout.splitlines():
+        ln = ln.strip()
+        if ln.startswith("{"):
+            with contextlib.suppress(Exception):
+                obj = json.loads(ln)
+    return obj
+
 def call_claude(system_prompt, user_text, model, timeout=240):
     # single LLM choke: every prompt is fenced in a per-call sentinel (WP1 ROW 1) — no path unwrapped
     system_prompt, user_text, _tok = _frame_untrusted(system_prompt, user_text)
-    cmd = ["claude", "-p", "--model", model,
-           "--no-session-persistence", "--tools", "",
-           "--disable-slash-commands", "--strict-mcp-config",
-           "--system-prompt", system_prompt, "--output-format", "json"]
     env = {**os.environ, "WIKI_ENGINE": "1"}
-    r = subprocess.run(cmd, input=user_text, capture_output=True, text=True,
-                       env=env, timeout=timeout)
-    obj = None
-    for ln in r.stdout.splitlines():
-        ln = ln.strip()
-        if ln.startswith("{"):
-            try: obj = json.loads(ln)
-            except Exception: pass
+    r = subprocess.run(_claude_argv(model, system_prompt), input=user_text,
+                       capture_output=True, text=True, env=env, timeout=timeout)
+    obj = _parse_claude_envelope(r.stdout)
     if not obj or obj.get("is_error"):
         raise RuntimeError("claude -p failed rc=%s err=%s out=%s"
                            % (r.returncode, r.stderr[-300:], r.stdout[-300:]))
@@ -949,13 +976,21 @@ def classify_record(header, cleaned, body, desc, cfg):
 def _record_skip(conn, sid, project, tpath, message_count, mtime, trigger, reason):
     """Write the ONLY trace a non-journaled record leaves: a CONTENT-FREE 'skipped' ledger marker
     (no page_path / title / description). Shared by the empty-transcript short-circuit and the
-    record-stage classifier so both leave an identical, content-free row (WP4 ROW 1)."""
-    conn.execute("""INSERT OR REPLACE INTO sessions
-        (session_id,project,transcript_path,first_seen,message_count,last_mtime,
-         summarized_at,summarized_by,status,skip_reason)
-        VALUES(?,?,?,?,?,?,?,?,?,?)""",
-        (sid, project, tpath, now_iso(), message_count, mtime,
-         now_iso(), trigger, "skipped", reason))
+    record-stage classifier so both leave an identical, content-free row (WP4 ROW 1).
+    UPDATE-in-place (like the error path) — a resumed session whose GROWN transcript now skips/
+    rejects must not clobber the prior good row: its day-1 journal entry is still on disk and cited,
+    so page_path/ingested_at/date/title survive and only status/skip_reason/mtime advance."""
+    updated = conn.execute("""UPDATE sessions SET project=?, transcript_path=?, message_count=?,
+        last_mtime=?, summarized_at=?, summarized_by=?, status='skipped', skip_reason=?
+        WHERE session_id=?""",
+        (project, tpath, message_count, mtime, now_iso(), trigger, reason, sid)).rowcount
+    if updated == 0:
+        conn.execute("""INSERT INTO sessions
+            (session_id,project,transcript_path,first_seen,message_count,last_mtime,
+             summarized_at,summarized_by,status,skip_reason)
+            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (sid, project, tpath, now_iso(), message_count, mtime,
+             now_iso(), trigger, "skipped", reason))
     conn.commit()
 
 # ---------------------------------------------------------------- journal writer
@@ -1017,7 +1052,7 @@ def write_journal(header, body, source_path, desc=None, rel=None, ingested_flag=
 # ---------------------------------------------------------------- commands
 def find_transcript(sid, cwd):
     hits = [p for p in glob.glob(str(PROJECTS / "**" / (sid + ".jsonl")), recursive=True)
-            if "/subagents/" not in p and "/subagents/" not in p.replace(os.sep, "/")]
+            if "/subagents/" not in p.replace(os.sep, "/")]
     if hits:
         return hits[0]
     return None
@@ -1218,7 +1253,7 @@ def recent_entries(limit, project_first=None):
     rows = conn.execute(
         "SELECT date, project, description, title FROM sessions "
         "WHERE summarized_at IS NOT NULL AND page_path IS NOT NULL "
-        "ORDER BY date DESC, summarized_at DESC LIMIT ?", (max(limit * 3, limit),)).fetchall()
+        "ORDER BY date DESC, summarized_at DESC LIMIT ?", (limit * 3,)).fetchall()
     out = [{"date": r[0] or "", "project": r[1] or "?", "desc": (r[2] or r[3] or "")} for r in rows]
     if project_first:
         out.sort(key=lambda r: 0 if r["project"] == project_first else 1)
@@ -1229,16 +1264,21 @@ def _held_or_pending():
     poisoned/held content a human hasn't accepted yet."""
     return _held_file().exists() or _pending().exists()
 
-def _digest_page_read(rel):
-    """Read a page's text for the digest. While an ingest is HELD/pending the working tree holds
-    unreviewed (possibly attacker-poisoned) pages, so read the last COMMITTED version from HEAD
-    instead — a held page never reaches a live session (closes the held-pages-on-disk leak, S5).
-    Returns None to SKIP a page (new-and-uncommitted while held, or unreadable). Capped + replace
-    so a single non-UTF8 page can't crash the whole digest."""
+def _quarantined_page_read(rel, held=None):
+    """THE single home of the S5 held-ingest quarantine, shared by every live-session page reader
+    (digest + query FTS). While an ingest is HELD/pending the working tree holds unreviewed
+    (possibly attacker-poisoned) pages, so read the last COMMITTED version from HEAD instead —
+    a held page never reaches a live session (closes the held-pages-on-disk leak, S5). Returns
+    None to SKIP a page (new-and-uncommitted while held, or unreadable). Capped + replace so a
+    single non-UTF8 page can't crash the caller. Pass a precomputed `held` when reading in a loop."""
+    if held is None:
+        held = _held_or_pending()
     try:
-        if _held_or_pending():
-            r = git("show", "HEAD:%s" % rel)
-            return r.stdout if r.returncode == 0 else None    # not in HEAD → new uncommitted page → skip
+        if held:
+            r = git("show", "HEAD:%s" % str(rel).replace(os.sep, "/"))
+            if r.returncode != 0:
+                return None                     # not in HEAD → new uncommitted page → skip
+            return r.stdout[:CFG_MAX_FILE]
         return _read_capped(WIKI / rel, errors="replace")
     except Exception:
         return None
@@ -1283,11 +1323,12 @@ def _wiki_disp():
 def _digest_project_slugs():
     """Cheap, BOUNDED top-level orientation: the project-page names the memory covers — names only,
     no descriptions/topics/link-graph (the full map is read on demand from index.md). Each name is
-    read through _digest_page_read, so while an ingest is HELD/pending it comes from committed HEAD
-    and an uncommitted/held project page is skipped (committed-content-only digest, S5)."""
+    read through _quarantined_page_read, so while an ingest is HELD/pending it comes from committed
+    HEAD and an uncommitted/held project page is skipped (committed-content-only digest, S5)."""
     slugs = []
+    held = _held_or_pending()
     for p in sorted(glob.glob(str(WIKI / "pages" / "projects" / "*.md"))):
-        txt = _digest_page_read(os.path.relpath(p, WIKI))
+        txt = _quarantined_page_read(os.path.relpath(p, WIKI), held)
         if txt is None:
             continue
         s = _inert_digest(parse_frontmatter(txt).get("slug") or Path(p).stem)
@@ -1638,15 +1679,17 @@ def _commit_identity_args():
         args += ["-c", "user.email=claude-wiki[bot]@users.noreply.github.com"]
     return args
 
-def git_commit(msg):
-    git("add", "-A")
-    git(*_commit_identity_args(), "commit", "-q", "-m", msg)
+def _git_commit_rc(msg, *paths):
+    """The single commit primitive: identity-injected, rc-returning, LOCK-FREE (for callers that
+    already hold gitwrite.lock). With paths, commits ONLY those paths; without, commits the index."""
+    scope = ("--",) + paths if paths else ()
+    return git(*_commit_identity_args(), "commit", "-q", "-m", msg, *scope)
 
 def git_commit_paths(msg, *paths):
     """Commit ONLY the given paths — never sweeps up unrelated staged/held changes."""
     with file_lock(WIKI / "state" / "gitwrite.lock"):   # one-way ordering: job lock → git lock
         git("add", "--", *paths)
-        return git(*_commit_identity_args(), "commit", "-q", "-m", msg, "--", *paths)
+        return _git_commit_rc(msg, *paths)
 
 def git_discard():
     # SCOPED: only undo ingest's output (pages/ + index.md). Never touches bin/, prompts/, SCHEMA, etc.
@@ -1698,22 +1741,27 @@ def _clear_held():
         _held_file().unlink()
 
 # ---------------------------------------------------------------- phase 3: daily auto-ingest
-def _last_ingest_file():
-    return WIKI / "state" / "last_ingest"
-
-def read_last_ingest():
-    p = _last_ingest_file()
+def _read_stamp(name):
+    """Last-run timestamp from state/<name>, '' when absent/unreadable."""
+    p = WIKI / "state" / name
     try:
         return p.read_text().strip() if p.exists() else ""
     except Exception:
         return ""
 
-def write_last_ingest(ts=None):
+def _write_stamp(name, ts=None):
     (WIKI / "state").mkdir(parents=True, exist_ok=True)
-    _atomic_write(_last_ingest_file(), ts or datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
+    _atomic_write(WIKI / "state" / name, ts or datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
+
+def read_last_ingest():
+    return _read_stamp("last_ingest")
+
+def write_last_ingest(ts=None):
+    _write_stamp("last_ingest", ts)
 
 # ---- cron scheduling (standard 5-field, evaluated in LOCAL time) ----
-def _cron_field(spec, lo, hi):
+@functools.lru_cache(maxsize=256)   # _cron_prev walks minute-by-minute; never re-parse the spec.
+def _cron_field(spec, lo, hi):      # (callers never mutate the returned set)
     out = set()
     for part in str(spec).split(","):
         step = 1
@@ -1793,15 +1841,10 @@ def ingest_due(cfg, now=None):
     return _job_due(cfg, "ingest", read_last_ingest(), now or datetime.now())
 
 def read_last_lint():
-    p = WIKI / "state" / "last_lint"
-    try:
-        return p.read_text().strip() if p.exists() else ""
-    except Exception:
-        return ""
+    return _read_stamp("last_lint")
 
 def write_last_lint(ts=None):
-    (WIKI / "state").mkdir(parents=True, exist_ok=True)
-    _atomic_write(WIKI / "state" / "last_lint", ts or datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
+    _write_stamp("last_lint", ts)
 
 def lint_due(cfg, now=None):
     return _job_due(cfg, "lint", read_last_lint(), now or datetime.now())
@@ -1918,10 +1961,20 @@ def _ingest_two_phase(rows, model, cfg):
                                input_text, model, timeout=600)           # phase ② (emits FILE-blocks)
     return result, cost, allowlist, selected
 
-def _flip_journal_ingested(page_path):
-    """Flip a journal entry's frontmatter `ingested: false` → `true` (atomically). This is the
-    DURABLE, git-synced ingested flag: it lets `reindex` rebuild ingested state from the journal
-    without re-folding already-ingested history through the LLM. Called at ingest-commit time only."""
+def _mark_ingested(text):
+    """Flip the durable `ingested: false` frontmatter flag to true (the ingest-commit direction)."""
+    return re.sub(r"(?m)^ingested:[ \t]*false[ \t]*$", "ingested: true", text, count=1)
+
+def _mark_uningested(text):
+    """Flip the durable `ingested: true` frontmatter flag so the next ingest re-folds this entry."""
+    return re.sub(r"(?m)^ingested:[ \t]*true[ \t]*$", "ingested: false", text, count=1)
+
+def _set_journal_ingested(page_path, value):
+    """Rewrite a journal entry's DURABLE, git-synced `ingested:` frontmatter flag (atomically).
+    True at ingest-commit time — it lets `reindex` rebuild ingested state from the journal without
+    re-folding already-ingested history through the LLM. False reverts after a FAILED ingest
+    commit: an uncommitted `ingested: true` left on disk would be seeded into the ledger by the
+    next reindex (which trusts frontmatter), permanently cancelling the promised retry."""
     if not page_path:
         return
     p = WIKI / page_path
@@ -1929,7 +1982,7 @@ def _flip_journal_ingested(page_path):
         txt = p.read_text(errors="surrogateescape")    # full read (rewrites the file) — never cap/truncate
     except Exception:
         return
-    new = re.sub(r"(?m)^ingested:\s*false\s*$", "ingested: true", txt, count=1)
+    new = (_mark_ingested if value else _mark_uningested)(txt)
     if new != txt:
         _atomic_write(p, new)                          # stage-then-promote (no symlink follow)
 
@@ -1995,11 +2048,6 @@ def _page_sid8s(text):
     """All sid8s cited by citation-shaped lines anywhere in `text` (whole-text scan on purpose:
     a decoy citation planted OUTSIDE ## Sources can only ADD a hold, never clear one)."""
     return {m.group(1).lower() for m in _CITE_SID8_RX.finditer(text or "")}
-
-def _head_page_text(relpath):
-    """HEAD's committed version of a page, or '' when untracked (genuinely-new page / non-git tree)."""
-    r = git("show", "HEAD:" + relpath)
-    return r.stdout if r.returncode == 0 else ""
 
 def _sources_block_span(lines):
     """(start, end) of the contiguous `- ` bullet run under the LAST `## Sources` heading, or None."""
@@ -2221,14 +2269,13 @@ def _risky_shapes(text):
         tags.append("imperative+2nd-person")
     return tags
 
-def _tracked_page_diff_lines(relpath, new_content):
-    """Changed (added+removed) line count between HEAD's committed version of `relpath` and
-    `new_content`; -1 if the page is not git-tracked (a genuinely-new page, exempt from the diff cap)."""
-    if git("cat-file", "-e", "HEAD:" + relpath).returncode != 0:
+def _tracked_page_diff_lines(head_text, new_content):
+    """Changed (added+removed) line count between the committed `head_text` and `new_content`;
+    -1 when head_text is None (not git-tracked — a genuinely-new page, exempt from the diff cap)."""
+    if head_text is None:
         return -1
-    old = git("show", "HEAD:" + relpath).stdout
-    return sum(1 for ln in difflib.unified_diff(old.splitlines(), (new_content or "").splitlines(),
-                                                n=0, lineterm="")
+    return sum(1 for ln in difflib.unified_diff(head_text.splitlines(),
+                                                (new_content or "").splitlines(), n=0, lineterm="")
                if ln[:1] in "+-" and not ln.startswith(("+++", "---")))
 
 # ---------------------------------------------------------------- v0.1.8: homonym guard (fold-time)
@@ -2304,7 +2351,9 @@ def _ingest_hold_reason(result, cfg):
     blocks = parse_file_blocks(result)
     known = _known_sid8s()          # v0.1.8 — engine-computed resolution set; model output can't extend it
     for relpath, content in blocks:
-        n = _tracked_page_diff_lines(relpath, content)
+        h = git("show", "HEAD:" + relpath)               # ONE HEAD materialization per block
+        head_text = h.stdout if h.returncode == 0 else None
+        n = _tracked_page_diff_lines(head_text, content)
         if n > cap:
             reasons.append("large rewrite of tracked page %s (%d changed lines > %d)" % (relpath, n, cap))
         tags = _risky_shapes(content)
@@ -2314,20 +2363,25 @@ def _ingest_hold_reason(result, cfg):
         # (an already-committed dangle is a lint finding, not a permanent hold-loop — SCHEMA rule 3
         # makes the model preserve existing Sources, so a non-delta gate could never converge).
         # Reason text embeds only regex-constrained 8-hex tokens + the block relpath.
-        intro = (_page_sid8s(content) - known) - _page_sid8s(_head_page_text(relpath))
+        intro = (_page_sid8s(content) - known) - _page_sid8s(head_text or "")
         if intro:
             reasons.append("unresolvable citation(s) in %s: %s (no matching journal entry)"
                            % (relpath, ", ".join(sorted(intro))))
     reasons.extend(_homonym_hold_reasons(blocks))          # v0.1.8 — new-page identity collisions
     return "; ".join(reasons)
 
-def _ingest_auto_batch(cfg, conn):
-    """One auto-accept ingest batch. Returns #sessions ingested; -1 = HELD (deterministic risk gate);
-    0 = nothing/failed."""
-    rows = conn.execute(
+def _uningested_rows(conn):
+    """(session_id, page_path) of every recorded-but-not-yet-folded session, chronological —
+    the ONE definition of 'pending for ingest' shared by the auto and manual paths."""
+    return conn.execute(
         "SELECT session_id, page_path FROM sessions "
         "WHERE summarized_at IS NOT NULL AND ingested_at IS NULL AND page_path IS NOT NULL "
         "ORDER BY date, summarized_at").fetchall()
+
+def _ingest_auto_batch(cfg, conn):
+    """One auto-accept ingest batch. Returns #sessions ingested; -1 = HELD (deterministic risk gate);
+    0 = nothing/failed."""
+    rows = _uningested_rows(conn)
     if not rows:
         return 0
     rows = rows[:cfg.get("ingest", {}).get("max_sessions_per_run", 50)]
@@ -2356,7 +2410,7 @@ def _ingest_auto_batch(cfg, conn):
     regenerate_index()
     slugs = ", ".join(sorted({os.path.splitext(os.path.basename(w))[0] for w in written}))
     for _, pp in rows:
-        _flip_journal_ingested(pp)      # durable flag, committed with this batch (exact path below)
+        _set_journal_ingested(pp, True)   # durable flag, committed with this batch (exact path below)
     # v0.1.8 — commit EXACT paths, not the bare `pages`/`journal` pathspecs: this runs unattended, and
     # a broad pathspec would sweep the user's concurrent hand-edits to unrelated pages into an
     # engine-authored commit. (The interactive --accept flow keeps the broad spec on purpose — there
@@ -2369,6 +2423,10 @@ def _ingest_auto_batch(cfg, conn):
         # v0.1.5 (integrity-audit I5): NEVER advance the ledger past a failed commit — written pages
         # would sit uncommitted (invisible to digest/HEAD) while the ledger claims them folded. Leave
         # everything for the next run: the fold re-emits full page bodies, so a retry converges.
+        # The flipped frontmatter flags must be reverted too — reindex seeds ingested_at from
+        # frontmatter, so an uncommitted `true` would cancel the retry this branch promises.
+        for _, pp in rows:
+            _set_journal_ingested(pp, False)
         log("ingest auto ERROR: git commit failed (%s) — ledger NOT advanced, will retry"
             % (r.stderr or r.stdout or "").strip()[:200])
         return 0
@@ -2382,14 +2440,9 @@ def _ingest_auto_batch(cfg, conn):
 def ingest_if_due(cfg):
     """Detached daily compile-trigger. Lock-guarded + day-claimed so concurrent session
     starts never double-run. Auto-commits (each batch is a revertible git commit)."""
-    import fcntl
-    (WIKI / "state").mkdir(parents=True, exist_ok=True)
-    lockf = open(WIKI / "state" / "ingest.lock", "w")
-    try:
-        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except Exception:
-        return 0                                     # another auto-ingest already running
-    try:
+    with _job_lock("ingest.lock") as acquired:
+        if not acquired:
+            return 0                                 # another auto-ingest already running
         if not ingest_due(cfg):
             return 0
         if _pending().exists():                      # manual review staged — don't auto-run over it
@@ -2405,50 +2458,45 @@ def ingest_if_due(cfg):
             total += n
         log("ingest --if-due: done, %d sessions auto-ingested" % total)
         return 0
-    finally:
-        try: fcntl.flock(lockf, fcntl.LOCK_UN)
-        finally: lockf.close()
 
-def _spawn_detached(argv):
+def _spawn_detached(argv, stdout=None):
+    """Detached re-entrant engine run (new session, no inherited stdin). `stdout` defaults to
+    DEVNULL; pass an open file to capture output (stderr follows stdout then)."""
     engine = str(Path(__file__).resolve())
     subprocess.Popen([sys.executable, engine] + list(argv),
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     stdout=stdout if stdout is not None else subprocess.DEVNULL,
+                     stderr=subprocess.STDOUT if stdout is not None else subprocess.DEVNULL,
                      stdin=subprocess.DEVNULL, start_new_session=True)
 
 # ---------------------------------------------------------------- phase 3: weekly full-wiki lint sweep
-# Lint-only detectors — DELIBERATELY narrower than the record/ingest SECURITY gate, and used ONLY by
-# _lint_shape_tags below. The enforcement path (classify_record / _risky_shapes / _ingest_hold_reason)
-# is UNCHANGED and still fail-closed: it holds or rejects at WRITE time on bare second-person address,
-# every imperative verb, and the high-entropy catch-all. The lint net, by contrast, is a RETROSPECTIVE
-# report over content that already landed (or predates the gate) — there, flagging every line that says
-# "you" or every camelCase identifier is pure noise that buries the real findings. So lint flags only
-# HIGH-SIGNAL shapes:
-#   injection: an actual instruction-override clause ("ignore/disregard/forget … previous/prior/above")
-#              — the canonical prompt-injection signature — NOT bare 2nd-person ("you"/"your", ~1 in 3
-#              wiki lines) nor everyday dev imperatives ("run the build", "delete the row").
-#   secret:    only the NAMED high-confidence credential patterns (AKIA/sk-/ghp_/stripe/…), NOT the
-#              high_entropy catch-all, which fires on Gradle task names (linkPod…Arm64) and C linker
-#              symbols and cannot be distinguished from a token without real entropy analysis.
+# Lint detectors — used ONLY by _lint_shape_tags below; the enforcement path (classify_record /
+# _risky_shapes / _ingest_hold_reason) is UNCHANGED and still fail-closed at WRITE time. The lint net
+# is a RETROSPECTIVE report over content that already landed (or predates/bypassed the gates — a
+# restored repo, a hand-edited page), so it must carry the same signal WITHOUT bare-shape noise
+# (flagging every line that says "you" or every imperative verb would bury the real findings):
+#   injection: the ingest gate's tiered shapes minus secrets and minus imperative+2nd-person — the
+#              override clause, pure-attack tokens (curl/wget/exfiltrate) and the imperative+URL
+#              exfil combo, ~0% on legit prose. imperative+2nd-person is write-gate-only: ordinary
+#              wiki prose addressed to the reader ("you should run the build") trips it, and lint
+#              noise buries the real findings.
+#   secret:    the FULL scan_secrets net including the high_entropy unknown-provider backstop — its
+#              Gradle-task/linker-symbol false-positive class was fixed structurally in v0.1.11
+#              (_looks_like_code_identifier), so lint no longer needs to narrow it. This sweep is
+#              the ONLY retroactive scan over content already on the remote (the push gate scans
+#              only new commits), so narrowing here left old credentials permanently undetectable.
 #   leak:      the same structural CoT/tool-transcript scaffold check (_LEAK_RX is already precise).
-_LINT_INJECTION_RX = re.compile(
-    r"\b(?:ignore|disregard|forget)\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|earlier)\b",
-    re.I)
-
-def _lint_secret_tags(text):
-    """scan_secrets minus the high_entropy catch-all: the named, high-confidence credential patterns
-    only. Never returns raw matched text (scan_secrets masks)."""
-    return [(n, m) for (n, m) in scan_secrets(text) if n != "high_entropy"]
-
 def _lint_shape_tags(text):
     """WP4 ROW 3 — DETECTION NET over content that ALREADY landed (pages + journal). Returns a
     CONTENT-FREE list of failure CLASS words (never the matched text): 'secret', 'injection', 'leak'.
-    Uses the lint-only detectors above (see their rationale), NOT the stricter security-gate shapes,
-    so a corpus of ordinary dev notes doesn't drown the report in false positives. Lint only REPORTS;
-    it never edits or deletes (detection, not enforcement) — the security gate does the enforcing."""
+    ONE _risky_shapes pass supplies both classes (see the rationale above): 'secret' is its
+    secret/PII tag (the full scan_secrets net), 'injection' is any other tag except the write-gate-
+    only imperative+2nd-person. Lint only REPORTS; it never edits or deletes (detection, not
+    enforcement) — the security gate does the enforcing."""
+    shapes = _risky_shapes(text or "")
     tags = []
-    if _lint_secret_tags(text):
+    if "secret/PII" in shapes:
         tags.append("secret")
-    if _LINT_INJECTION_RX.search(text or ""):
+    if any(t not in ("secret/PII", "imperative+2nd-person") for t in shapes):
         tags.append("injection")
     if _LEAK_RX.search(text or ""):
         tags.append("leak")
@@ -2479,7 +2527,8 @@ def _page_freshness_age(fm, text, today):
 def lint_deterministic():
     """Free structural checks over ALL pages (+ the WP4 detection net over pages AND journal entries).
     Returns (findings dict, pages dict, report markdown)."""
-    lc = load_config().get("lint", {}) if isinstance(load_config().get("lint"), dict) else {}
+    _cfg_all = load_config()
+    lc = _cfg_all.get("lint") if isinstance(_cfg_all.get("lint"), dict) else {}
     maxlines = lc.get("max_page_lines", 160)
     desc_cap = int(lc.get("desc_max_chars", 120))
     stale_days = {"projects": int(lc.get("stale_projects_days", 60)),
@@ -2664,14 +2713,9 @@ def run_lint(cfg):
     return report
 
 def lint_if_due(cfg):
-    import fcntl
-    (WIKI / "state").mkdir(parents=True, exist_ok=True)
-    lockf = open(WIKI / "state" / "lint.lock", "w")
-    try:
-        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except Exception:
-        return 0
-    try:
+    with _job_lock("lint.lock") as acquired:
+        if not acquired:
+            return 0
         if not lint_due(cfg):
             return 0
         if _pending().exists():          # ingest staged/held → don't lint a half-resolved tree
@@ -2680,9 +2724,6 @@ def lint_if_due(cfg):
         write_last_lint()   # stamp this cron occurrence before the slow work (prevents duplicate runs)
         run_lint(cfg)
         return 0
-    finally:
-        try: fcntl.flock(lockf, fcntl.LOCK_UN)
-        finally: lockf.close()
 
 def cmd_lint(args):
     cfg = load_config()
@@ -2988,14 +3029,9 @@ def cmd_maintain(args):
         log("maintain: REFUSED — stale cache engine %s != installed %s (restart Claude Code); "
             "jobs stay due and run on the next current-engine session start" % stale)
         return 0
-    import fcntl
-    (WIKI / "state").mkdir(parents=True, exist_ok=True)
-    lockf = open(WIKI / "state" / "compile.lock", "w")
-    try:
-        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except Exception:
-        return 0
-    try:
+    with _job_lock("compile.lock") as acquired:
+        if not acquired:
+            return 0
         if not schema_guard():   # WP4 ROW 4 — never compile against newer-than-engine data
             return 3
         _sync_pull()      # multi-device: rebase in others' work before compiling (no-op if sync off)
@@ -3006,9 +3042,6 @@ def cmd_maintain(args):
         lint_if_due(cfg)       # weekly (lints the freshly-ingested state)
         _journal_retention(cfg)   # S3: archive ingested journal entries older than archive_after_days
         return 0
-    finally:
-        try: fcntl.flock(lockf, fcntl.LOCK_UN)
-        finally: lockf.close()
 
 def cmd_ingest(args):
     cfg = load_config()
@@ -3023,9 +3056,12 @@ def cmd_ingest(args):
         pend = json.loads(_pending().read_text()) if _pending().exists() else []
         if not pend:
             print("nothing staged to accept."); return 0
+        flipped = []
         for sid in pend:
             r = conn.execute("SELECT page_path FROM sessions WHERE session_id=?", (sid,)).fetchone()
-            if r: _flip_journal_ingested(r[0])   # durable flag, committed with the accept below
+            if r:
+                _set_journal_ingested(r[0], True)   # durable flag, committed with the accept below
+                flipped.append(r[0])
         dirty = bool(git("status", "--porcelain", "--", "pages", "index.md", "journal").stdout.strip())
         _oplog("ingest", "%d session(s) → topics/projects (accepted)" % len(pend))
         rc = git_commit_paths("ingest: %d sessions → topics/projects" % len(pend), "pages", "index.md", "journal",
@@ -3033,8 +3069,12 @@ def cmd_ingest(args):
         if dirty and rc.returncode != 0:
             # v0.1.5 (integrity-audit I3/I5): there WERE staged changes and the commit failed —
             # accepting now would mark sessions folded with nothing landed. Keep the pending
-            # review intact and refuse. (A clean tree with rc!=0 is the hand-committed case:
-            # "nothing to commit" — the content is already in HEAD, marking is correct.)
+            # review intact and refuse, reverting the flipped flags (reindex seeds ingested state
+            # from frontmatter, so an uncommitted `true` would cancel the retry). (A clean tree
+            # with rc!=0 is the hand-committed case: "nothing to commit" — the content is already
+            # in HEAD, marking is correct.)
+            for pp in flipped:
+                _set_journal_ingested(pp, False)
             print("accept FAILED: git commit did not land (%s) — batch left staged, nothing marked."
                   % (rc.stderr or rc.stdout or "").strip()[:200])
             return 1
@@ -3058,10 +3098,7 @@ def cmd_ingest(args):
         return 1
     if git("status", "--porcelain", "--", "pages", "index.md", "journal").stdout.strip():
         git_commit_paths("checkpoint before ingest", "pages", "index.md", "journal")
-    rows = conn.execute(
-        "SELECT session_id, page_path FROM sessions "
-        "WHERE summarized_at IS NOT NULL AND ingested_at IS NULL AND page_path IS NOT NULL "
-        "ORDER BY date, summarized_at").fetchall()   # chronological: build the story in order, newest-wins across batches
+    rows = _uningested_rows(conn)   # chronological: build the story in order, newest-wins across batches
     if not rows:
         print("ingest: nothing to ingest (all recorded sessions already ingested)."); return 0
     limit = cfg.get("ingest", {}).get("max_sessions_per_run", 50)
@@ -3265,15 +3302,24 @@ def keyword_search(q, limit=10, include_archive=False, include_journal=False):
     hot journal in for drill-downs (lint verification, recent un-ingested work); the S3 retention
     archive additionally needs `--include-archive` (which implies the journal)."""
     include_journal = include_journal or include_archive
+    held = _held_or_pending()   # S5: while an ingest is HELD, working-tree pages are unreviewed
     db = sqlite3.connect(":memory:")
     db.execute("CREATE VIRTUAL TABLE docs USING fts5(path, title, body)")
+    jtexts = {}                 # journal rel → text, reused by the withhold pass below (no re-read)
     for base in (("pages", "journal") if include_journal else ("pages",)):
         for p in glob.glob(str(WIKI / base / "**" / "*.md"), recursive=True):
             if not include_archive and _under_journal_archive(p):
                 continue                              # retention archive — out of the hot search path
-            txt = _read_capped(p, errors="replace")   # bounded FTS insert — an oversized page can't OOM query
+            rel = os.path.relpath(p, WIKI)
+            if rel.startswith("pages" + os.sep):
+                txt = _quarantined_page_read(rel, held)   # bounded read — an oversized page can't OOM query
+                if txt is None:
+                    continue                          # held + not in HEAD → staged/unreviewed → skip
+            else:
+                txt = _read_capped(p, errors="replace")
+                jtexts[rel] = txt
             db.execute("INSERT INTO docs VALUES(?,?,?)",
-                       (os.path.relpath(p, WIKI), parse_frontmatter(txt).get("name", ""),
+                       (rel, parse_frontmatter(txt).get("name", ""),
                         _strip_recall_line(txt)))
     snip = "snippet(docs, 2, '»', '«', '…', 14)"
     def run(match):
@@ -3296,7 +3342,17 @@ def keyword_search(q, limit=10, include_archive=False, include_journal=False):
     out = [{"path": p, "title": t or "", "snippet": " ".join(sn.split()),
             "score": rank, "kind": _doc_kind(p)} for (p, t, sn, rank) in rows]
     out.sort(key=lambda r: (r["score"], kindrank.get(r["kind"], 2)))   # relevance-first; kind breaks ties
-    return out[:limit]
+    out = out[:limit]
+    # Journal bodies never pass a review gate (pages do — ingest holds risky folds reviewably), so a
+    # risky-shaped journal entry must not serve its payload into a live session via the snippet.
+    # Keep the HIT (path + title — the user learns the entry exists) but withhold the snippet,
+    # naming only the shape classes (content-free, same contract as the record classifier).
+    for hit in out:
+        if hit["kind"] == "journal":
+            tags = _risky_shapes(jtexts.get(hit["path"], ""))
+            if tags:
+                hit["snippet"] = "[snippet withheld — risky shapes: %s]" % ", ".join(tags)
+    return out
 
 # ---------------------------------------------------------------- secret gate (Phase 5)
 # ReDoS hygiene (WP1 ROW 2): every pattern below is linear-time — no nested/overlapping quantifiers
@@ -3381,8 +3437,9 @@ def _mask(s):
 
 def _iter_secret_matches(text):
     """(name, rx, match) for every pattern hit that survives its pattern's exemption predicate. The
-    single chokepoint shared by scan_secrets and _redact_secrets, so detection and redaction can
-    never disagree about what counts as a secret (the write-path parity the init gate relies on)."""
+    single DETECTION chokepoint (scan_secrets, _scrub_scan), so detectors can never disagree about
+    what counts as a secret (the write-path parity the init gate relies on). _redact_secrets is the
+    one legitimate exception: it applies the same patterns + exemptions via rx.sub — keep in sync."""
     for name, rx in SECRET_PATTERNS:
         exempt = _PATTERN_EXEMPT.get(name)
         for m in rx.finditer(text):
@@ -3639,6 +3696,39 @@ def _validate_init_target(target):
         return (True, "")
     return (False, "unsupported target — use owner/repo, https://…, ssh (git@host:path), or a local path")
 
+def _gh_repo_url(slug, view_timeout=60):
+    """Resolve a gh repo slug to a clone URL honoring the user's git_protocol. Returns (url, '')
+    or (None, reason). Fail closed: never mints '.git' from a missing url field (pre-_ls_remote_heads
+    a relative '.git' resolved to the wiki's OWN repo → has_main; the guard stays: fail by NAME)."""
+    try:
+        r = subprocess.run(["gh", "repo", "view", slug, "--json", "url,sshUrl"],
+                           capture_output=True, text=True, timeout=view_timeout)
+    except subprocess.TimeoutExpired:
+        return None, "gh repo view timed out"
+    if r.returncode != 0:
+        return None, (r.stderr or "").strip()[:200]
+    info = json.loads(r.stdout or "{}")
+    try:
+        proto = subprocess.run(["gh", "config", "get", "git_protocol"],
+                               capture_output=True, text=True, timeout=10).stdout.strip()
+    except subprocess.TimeoutExpired:
+        return None, "gh config get timed out"
+    url = info.get("sshUrl") if proto == "ssh" else (
+        (info.get("url") + ".git") if info.get("url") else None)
+    return (url, "") if url else (None, "gh returned no url")
+
+def _gh_repo_create(slug):
+    """`gh repo create --private`, tolerating 'already exists'. Returns '' on success/exists,
+    else a reason string (timeout / gh error)."""
+    try:
+        made = subprocess.run(["gh", "repo", "create", slug, "--private"],
+                              capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return "gh repo create timed out"
+    if made.returncode != 0 and "already exists" not in (made.stderr or ""):
+        return "gh repo create failed: %s" % (made.stderr or "").strip()[:200]
+    return ""
+
 def _ls_remote_heads(url):
     """ls-remote with no repo context: cwd-independent (cwd='/'), 120s cap like git_net.
     ONLY for _remote_state's routing probe — rows 1/2 run before WIKI even exists, where
@@ -3661,29 +3751,11 @@ def _remote_state(target):
         import shutil as _sh
         if not _sh.which("gh"):
             return ("unreachable", None, "gh not installed — install gh or pass a git URL")
-        try:
-            r = subprocess.run(["gh", "repo", "view", target, "--json", "url,sshUrl"],
-                               capture_output=True, text=True, timeout=30)
-        except subprocess.TimeoutExpired:
-            return ("unreachable", None, "gh repo view timed out")
-        if r.returncode != 0:
-            err = (r.stderr or "").strip()
-            if "Could not resolve to a Repository" in err:
-                return ("absent", None, err[:200])
-            return ("unreachable", None, err[:200])
-        info = json.loads(r.stdout or "{}")
-        try:
-            proto = subprocess.run(["gh", "config", "get", "git_protocol"],
-                                   capture_output=True, text=True, timeout=10).stdout.strip()
-        except subprocess.TimeoutExpired:
-            return ("unreachable", None, "gh config get timed out")
-        # only from truthy fields — a missing url must fail closed here, never become ".git"
-        # (pre-_ls_remote_heads a relative ".git" resolved to the wiki's OWN repo → has_main;
-        #  under cwd="/" it is merely unreachable, but the guard stays: fail closed by NAME)
-        url = info.get("sshUrl") if proto == "ssh" else (
-            (info.get("url") + ".git") if info.get("url") else None)
+        url, err = _gh_repo_url(target, view_timeout=30)
         if not url:
-            return ("unreachable", None, "gh returned no url")
+            if "Could not resolve to a Repository" in err:
+                return ("absent", None, err)
+            return ("unreachable", None, err)
     ls = _ls_remote_heads(url)
     if ls.returncode != 0:
         err = (ls.stderr or "").strip()
@@ -3942,12 +4014,8 @@ def _record_sync_commit_push(old_page, page, slug, sid):
             paths.append(trel)                      # the redacted synced copy rides along too
         git_commit_paths("record: %s %s" % (slug, sid[:8]), *paths)
         if cfg.get("auto_push", True):
-            engine = str(Path(__file__).resolve())
             (WIKI / "logs").mkdir(parents=True, exist_ok=True)   # fresh clone/temp repo has no logs/
-            subprocess.Popen([sys.executable, engine, "_push"],
-                             stdin=subprocess.DEVNULL,           # never inherit the hook's stdin pipe
-                             stdout=open(WIKI / "logs" / "wiki.log", "a"),
-                             stderr=subprocess.STDOUT, start_new_session=True)
+            _spawn_detached(["_push"], stdout=open(WIKI / "logs" / "wiki.log", "a"))
     except Exception as e:
         log("record: sync skipped (non-fatal):", repr(e))
 
@@ -4092,10 +4160,6 @@ _DERIVED_FILES = ("index.md", "lint-report.md")
 def _is_derived(rel):
     return rel in _DERIVED_FILES or rel.startswith("pages/")
 
-def _mark_uningested(text):
-    """Flip the durable `ingested: true` frontmatter flag so the next ingest re-folds this entry."""
-    return re.sub(r"(?m)^ingested:[ \t]*true[ \t]*$", "ingested: false", text, count=1)
-
 def _clear_ledger_ingested(session_ids):
     """reindex_ledger COALESCEs ingested_at, so an existing row keeps its stamp even after the
     frontmatter flag flips — the re-fold must be forced in the DB too."""
@@ -4128,6 +4192,11 @@ def _resolve_derived_conflict(branch):
         blob = git("show", "HEAD:" + rel)
         if blob.returncode == 0:
             saved[rel] = blob.stdout
+    # Local pages/ content the reset below will replace with the remote's version. Engine folds are
+    # reconstructible from the journal, but a HAND-edit to a page (lint fixes, --accept hand-fixes,
+    # Obsidian) is not — so the discard must be LOUD and recoverable, not a log line: name the files
+    # in the committed oplog and point at the sync-preconflict branch that still holds them.
+    lost_pages = [p for p in local if not p.startswith("journal/")]
     git("branch", "-f", "sync-preconflict", "HEAD")   # nothing becomes unreachable
     if git("reset", "--hard", remote).returncode != 0:
         return False
@@ -4142,10 +4211,20 @@ def _resolve_derived_conflict(branch):
                 sids.append(sid)
     if saved:
         git("add", "--", *sorted(saved))
-        git("commit", "-q", "-m",
-            "sync: re-applied %d local journal entr%s after derived-file conflict"
-            % (len(saved), "y" if len(saved) == 1 else "ies"))
+        r = _git_commit_rc("sync: re-applied %d local journal entr%s after derived-file conflict"
+                           % (len(saved), "y" if len(saved) == 1 else "ies"))
+        if r.returncode != 0:
+            # Staged-but-uncommitted journal entries must not be reported as healed: the gated push
+            # would publish a history missing them. Fall back to the visible flag-and-proceed path.
+            log("sync: derived-conflict re-apply commit FAILED (%s)"
+                % (r.stderr or r.stdout or "").strip()[:200])
+            return False
         _clear_ledger_ingested(sids)
+    if lost_pages:
+        _oplog("sync", "derived-file conflict: remote version kept for %d local file(s): %s — "
+               "if any carried a hand-edit, recover it from branch sync-preconflict"
+               % (len(lost_pages), ", ".join(sorted(lost_pages)[:6])
+                  + (", …" if len(lost_pages) > 6 else "")))
     return True
 
 def _sync_pull():
@@ -4254,8 +4333,7 @@ def _adopt_corpus():
     with file_lock(WIKI / "state" / "gitwrite.lock"):
         git("add", "-A")
         if git("status", "--porcelain").stdout.strip():          # skip-if-clean (resumable)
-            r = git(*_commit_identity_args(),
-                    "commit", "-q", "-m", "init: adopt existing wiki corpus")
+            r = _git_commit_rc("init: adopt existing wiki corpus")
             if r.returncode != 0:
                 print("init: adoption commit failed:", (r.stderr or "")[:200]); return 1
     return 0
@@ -4341,28 +4419,14 @@ def _init_publish(target, yes, url=None, confirm_consumed=False, locked=False, d
                 remote_url = target                          # explicit URL/path target — no gh needed
             if not remote_url:
                 slug = default_slug            # WP2 ROW 1 — resolved by cmd_init (explicit or gh-derived)
-                try:
-                    made = subprocess.run(["gh", "repo", "create", slug, "--private"],
-                                          capture_output=True, text=True, timeout=60)
-                except subprocess.TimeoutExpired:
-                    print("gh repo create timed out"); return 1
-                if made.returncode != 0 and "already exists" not in (made.stderr or ""):
-                    print("gh repo create failed:", (made.stderr or "").strip()[:200]); return 1
-                try:
-                    info = subprocess.run(["gh", "repo", "view", slug, "--json", "url,sshUrl"],
-                                          capture_output=True, text=True, timeout=60)
-                except subprocess.TimeoutExpired:
-                    print("gh repo view timed out"); return 1
-                data = json.loads(info.stdout or "{}") if info.returncode == 0 else {}
-                try:
-                    proto = subprocess.run(["gh", "config", "get", "git_protocol"],
-                                           capture_output=True, text=True, timeout=10).stdout.strip()
-                except subprocess.TimeoutExpired:
-                    print("gh config get timed out"); return 1
-                # only from truthy fields — a missing url must stay falsy (None), never ".git",
-                # so the cannot-resolve guard below actually fires instead of wiring a bogus origin
-                remote_url = data.get("sshUrl") if proto == "ssh" else (
-                    (data.get("url") + ".git") if data.get("url") else None)
+                gh_err = _gh_repo_create(slug)
+                if gh_err:
+                    print(gh_err); return 1
+                # fail-closed URL resolution (see _gh_repo_url): a missing url must stay falsy,
+                # never ".git", so the cannot-resolve guard below fires instead of wiring a bogus origin
+                remote_url, gh_err = _gh_repo_url(slug)
+                if not remote_url:
+                    print("cannot resolve remote url:", gh_err); return 1
             if not remote_url:
                 print("cannot resolve remote url"); return 1
             added = git("remote", "add", "origin", remote_url)
@@ -4399,7 +4463,7 @@ def _init_publish(target, yes, url=None, confirm_consumed=False, locked=False, d
 
 # Tasks 4-5 replace these with SEED-FRESH/SEED-RESUME and RESTORE/RESTORE-RESUME; stubs here just
 # keep the routing below compiling + runnable in the meantime.
-def _cmd_init_seed(target, yes, state, url, default_slug=None, resume=False):
+def _cmd_init_seed(target, yes, state, url, default_slug=None):
     """Rows 2/2b (sync/init design): confirm → ensure remote FIRST (R3) → skeleton → git init →
     first commit → hand off to _init_publish with the confirm consumed."""
     slug = default_slug            # WP2 ROW 1 — explicit target or gh-derived, resolved by cmd_init
@@ -4415,11 +4479,9 @@ def _cmd_init_seed(target, yes, state, url, default_slug=None, resume=False):
             print("init: state changed under init (concurrent record?) — re-run wiki init")
             return 1
         if state == "absent":                                    # gh-slug only (router guarantees)
-            made = subprocess.run(["gh", "repo", "create", slug, "--private"],
-                                  capture_output=True, text=True, timeout=60)
-            if made.returncode != 0 and "already exists" not in (made.stderr or ""):
-                print("init: gh repo create failed: %s — nothing was changed locally"
-                      % (made.stderr or "").strip()[:200]); return 1
+            gh_err = _gh_repo_create(slug)
+            if gh_err:
+                print("init: %s — nothing was changed locally" % gh_err); return 1
             state, url, detail = _remote_state(slug)
             if state == "has_main":
                 # the tolerated "already exists" above can mean a REAL race: the remote already
@@ -4458,7 +4520,7 @@ def _finish_restore():
     print("init: restored + armed (origin/%s, %d ledger rows)" % (branch, n))
     return 0
 
-def _cmd_init_restore(target, yes, url, default_slug=None, _retried=False):
+def _cmd_init_restore(target, yes, url, default_slug=None):
     """Row 1 (sync/init design): banner+confirm → temp clone → adopt .git → checkout → finish."""
     import shutil as _sh
     label = default_slug           # WP2 ROW 1 — explicit target or gh-derived, resolved by cmd_init
@@ -4516,7 +4578,10 @@ def _cmd_init_restore(target, yes, url, default_slug=None, _retried=False):
         if not ok:
             for entry in list(WIKI.iterdir()):     # undo the checkout: tree was verified empty pre-restore
                 if entry.name not in ("state", "logs", ".git"):
-                    _sh.rmtree(str(entry), ignore_errors=True) if entry.is_dir() else entry.unlink(missing_ok=True)
+                    if entry.is_dir():
+                        _sh.rmtree(str(entry), ignore_errors=True)
+                    else:
+                        entry.unlink(missing_ok=True)
             return _refuse(reason)
         return _finish_restore()
 
@@ -4575,7 +4640,7 @@ def _init_validate_repair(target):
     print("init: healthy — armed (origin/%s), hook installed" % branch)
     return 0
 
-def cmd_init(args, _retried=False):
+def cmd_init(args):
     yes = "--yes" in args
     target = next((a for a in args if not a.startswith("--")), None)
     # WP2 ROW 4 — validate the (attacker-influenceable) target BEFORE it can reach any git/gh call.
@@ -4633,9 +4698,9 @@ def cmd_init(args, _retried=False):
             print("init: this machine has a part-initialized empty wiki and the remote "
                   "already has memory — move %s aside and re-run `wiki init` to restore"
                   % WIKI); return 1                              # row 2b'
-        return _cmd_init_seed(target, yes, state, url, default_slug=default_slug, resume=True)  # row 2b
+        return _cmd_init_seed(target, yes, state, url, default_slug=default_slug)  # row 2b
     if state == "has_main":
-        return _cmd_init_restore(target, yes, url, default_slug=default_slug, _retried=_retried)  # row 1
+        return _cmd_init_restore(target, yes, url, default_slug=default_slug)  # row 1
     return _cmd_init_seed(target, yes, state, url, default_slug=default_slug)               # row 2
 
 def cmd_sync(args):
@@ -4834,21 +4899,13 @@ def _claude_contract_check(timeout):
     import shutil
     if not shutil.which("claude"):
         return None, "claude not installed — contract not checked"
-    cmd = ["claude", "-p", "--model", MODEL_DEFAULTS["record"],
-           "--no-session-persistence", "--tools", "",
-           "--disable-slash-commands", "--strict-mcp-config",
-           "--system-prompt", "Reply with the single word: ok", "--output-format", "json"]
     try:
-        r = subprocess.run(cmd, input="ping", capture_output=True, text=True,
+        r = subprocess.run(_claude_argv(MODEL_DEFAULTS["record"], "Reply with the single word: ok"),
+                           input="ping", capture_output=True, text=True,
                            env={**os.environ, "WIKI_ENGINE": "1"}, timeout=timeout)
     except (subprocess.TimeoutExpired, OSError) as e:
         return None, "probe failed/timed out (%s) — contract not checked" % type(e).__name__
-    obj = None
-    for ln in r.stdout.splitlines():
-        ln = ln.strip()
-        if ln.startswith("{"):
-            with contextlib.suppress(Exception):
-                obj = json.loads(ln)
+    obj = _parse_claude_envelope(r.stdout)
     if not isinstance(obj, dict):
         return False, "no JSON object in `claude -p --output-format json` output — CLI contract drift?"
     missing = [k for k in ("result", "is_error") if k not in obj]
@@ -4925,12 +4982,8 @@ def _scrub_scan():
                 with gzip.open(p, "rt", errors="replace") as f:
                     for line in f:
                         line = line[:1_000_000]        # bounded per line, same cap as the cleaner
-                        for cname, rx in SECRET_PATTERNS:
-                            exempt = _PATTERN_EXEMPT.get(cname)
-                            for m in rx.finditer(line):
-                                if not (exempt and exempt(m.group(0))):
-                                    classes.add(cname)
-                                    break
+                        for cname, _rx, _m in _iter_secret_matches(line):
+                            classes.add(cname)         # the chokepoint applies the exemptions
             except Exception:
                 continue                               # unreadable archive — skip, retry next run
             ent = {"hash": h, "ver": ver, "classes": sorted(classes)}
@@ -5006,11 +5059,12 @@ def cmd_doctor(args):
     import shutil
     cfg = load_config()
     want_claude_contract = "--claude-contract" in args   # WP5 (S8): opt-in LIVE `claude -p` envelope probe
-    fails = [0]
+    fails = 0
     def line(label, ok, detail="", critical=False):
+        nonlocal fails
         print("  %s %-11s %s" % ("✓" if ok else "⚠", label, detail))
         if not ok and critical:
-            fails[0] += 1
+            fails += 1
     print("wiki doctor:")
     line("python3", True, sys.version.split()[0])
     line("claude", bool(shutil.which("claude")), shutil.which("claude") or "not found")
@@ -5096,7 +5150,7 @@ def cmd_doctor(args):
         for prob in cfg_problems:
             print("      - %s" % prob)
         if cfg_critical:
-            fails[0] += 1
+            fails += 1
     else:
         print("  ✓ %-11s valid" % "config")
     # WP4 ROW 2 — record-failure surfacing (last success / error count + last error) + stale-capture note.
@@ -5134,7 +5188,7 @@ def cmd_doctor(args):
         line("scrub", False,
              "%d/%d synced transcript(s) hold now-detectable secret shape(s) [%s] (sids: %s) — "
              "rotate the credential(s); re-redact + history rewrite optional" % (len(flagged), stot, classes, sids))
-    return 1 if fails[0] else 0
+    return 1 if fails else 0
 
 def main():
     # WP5 (S9) — POSIX-only: the engine relies on fcntl locking, O_NOFOLLOW, launchd/cron scheduling

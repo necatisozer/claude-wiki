@@ -20,7 +20,10 @@ fi
 # numerically forever while its `git pull` (how `marketplace update` refreshes) permanently
 # fails against the unrelated new history, so it would silently keep serving the old engine.
 EXPECT="0.1.16"
-MANIFEST="$HOME/.claude/plugins/marketplaces/claude-wiki/.claude-plugin/plugin.json"
+# Same config-dir resolution as bin/wiki and session_end_record.sh — a relocated CLAUDE_CONFIG_DIR
+# moves the marketplace clone (and thus the manifest + engine) with it.
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+MANIFEST="$CLAUDE_DIR/plugins/marketplaces/claude-wiki/.claude-plugin/plugin.json"
 mkt_version() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("version",""))' "$MANIFEST" 2>/dev/null || true; }
 claude plugin marketplace add necatisozer/claude-wiki >/dev/null 2>&1 || true
 claude plugin marketplace update claude-wiki >/dev/null 2>&1 || true
@@ -49,5 +52,5 @@ fi
 if printf '%s' "$LIST" | grep -A3 "wiki@claude-wiki" | grep -qi "disabled"; then
   echo "error: plugin installed but disabled — run: claude plugin enable wiki@claude-wiki" >&2; exit 1
 fi
-ENGINE="${WIKI_INSTALL_ENGINE:-$HOME/.claude/plugins/marketplaces/claude-wiki/bin/wiki}"
+ENGINE="${WIKI_INSTALL_ENGINE:-$CLAUDE_DIR/plugins/marketplaces/claude-wiki/bin/wiki}"
 exec python3 "$ENGINE" init ${1:+"$1"} --yes

@@ -118,7 +118,7 @@ fake3 = Path(tempfile.mkdtemp(prefix="wiki5_gh_"))
 (fake3 / "gh").write_text(
     "#!/bin/sh\n"
     'case "$1 $2" in\n'
-    '  "repo view") echo "GraphQL: Could not resolve to a Repository" >&2; exit 1;;\n'
+    '  "repo view") printf \'{"url":"https://x.test/o/r","sshUrl":"git@x.test:o/r.git"}\'; exit 0;;\n'
     '  "repo create") exit 0;;\n'
     '  "config get") sleep 12; echo https; exit 0;;\n'
     "esac\n"
