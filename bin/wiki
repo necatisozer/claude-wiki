@@ -3525,7 +3525,11 @@ def schema_guard():
 
 # ---------------------------------------------------------------- init (v1.2)
 GITIGNORE_REQUIRED =["state/", "logs/", "*.db", "*.db-wal", "*.db-shm", ".cache/",
-                      "__pycache__/", "*.pyc", ".githooks/", ".DS_Store"]
+                      "__pycache__/", "*.pyc", ".githooks/", ".DS_Store",
+                      # Obsidian-as-reader support: the vault's workspace/config churn and its
+                      # app-side trash must never enter the synced repo (workspace.json changes on
+                      # every window move — cross-device sync noise and conflict bait).
+                      ".obsidian/", ".trash/"]
 DEFAULT_CONFIG = {
     "enabled": True,
     "schema_version": ENGINE_SCHEMA,   # stamped at init; the WP4 forward-compat guard reads it
