@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Silent thread-drop hold.** A live fold deleted nine open `## Active threads`
+  bullets from a project page although no session in the batch mentioned them;
+  the diff cap didn't trip, so accepting would have lost those follow-ups
+  without a trace. A dropped bullet now counts as accounted for only when a
+  similar bullet survives on the new page, or one of its distinctive tokens
+  (ticket id, `#PR`, `code` span) appears in text the batch newly added to any
+  page — i.e. the fold recorded its resolution or move. More than
+  `ingest.max_dropped_threads` (default 2) unaccounted drops on one page holds
+  the batch with a content-free reason. Calibrated on a 34-fold history: the
+  default cap holds 2 folds (including the incident), where a zero cap would
+  hold 15.
+
 ## [0.1.19] - 2026-09-16
 
 ### Fixed

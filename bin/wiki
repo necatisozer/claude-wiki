@@ -2375,6 +2375,51 @@ def _elision_hits(head_text, new_content):
     old = {m.group(0).lower() for m in _ELISION_RX.finditer(head_text)}
     return sum(1 for m in _ELISION_RX.finditer(new_content or "") if m.group(0).lower() not in old)
 
+# Silent thread drops: a fold that deletes open `## Active threads` bullets from a tracked page with no
+# evidence they were resolved or moved loses the follow-ups without a trace. A dropped bullet is
+# ACCOUNTED FOR when a similar bullet survives anywhere on the new page, or when one of its
+# distinctive tokens (ticket id, PR number, `code` span) appears in text this batch NEWLY added to
+# any page (the fold recorded its resolution/move). Everything else counts as an unaccounted drop.
+_THREAD_TOKEN_RX = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b|#\d+\b|`[^`\n]{3,80}`")
+
+def _section_bullets(text, heading="## Active threads"):
+    out, inside = [], False
+    for ln in (text or "").splitlines():
+        if ln.startswith("## "):
+            inside = ln.strip().lower() == heading.lower()
+            continue
+        if inside and ln.startswith("- "):
+            out.append(ln[2:].strip())
+    return out
+
+def _norm_bullet(b):
+    return re.sub(r"[^a-z0-9]+", " ", b.lower()).strip()
+
+def _added_text(head_text, new_content):
+    """Lines present in new_content but not in head_text (whole page for a new page)."""
+    old = set((head_text or "").splitlines())
+    return "\n".join(ln for ln in (new_content or "").splitlines() if ln not in old)
+
+def _unaccounted_thread_drops(head_text, new_content, batch_added):
+    """Count of HEAD `## Active threads` bullets dropped with no similar survivor on the new page
+    and no distinctive token in `batch_added` (text newly added across the whole batch)."""
+    if head_text is None:
+        return 0
+    new_norms = [_norm_bullet(ln[2:]) for ln in (new_content or "").splitlines() if ln.startswith("- ")]
+    new_norm_set = set(new_norms)
+    n = 0
+    for b in _section_bullets(head_text):
+        nb = _norm_bullet(b)
+        if not nb or nb in new_norm_set:
+            continue
+        if any(difflib.SequenceMatcher(None, nb, x).ratio() >= 0.6 for x in new_norms):
+            continue
+        toks = _THREAD_TOKEN_RX.findall(b)
+        if toks and any(t in batch_added for t in toks):
+            continue
+        n += 1
+    return n
+
 def _tracked_page_diff_lines(head_text, new_content):
     """Changed (added+removed) line count between the committed `head_text` and `new_content`;
     -1 when head_text is None (not git-tracked — a genuinely-new page, exempt from the diff cap)."""
@@ -2455,13 +2500,22 @@ def _ingest_hold_reason(result, cfg):
            for m in _HARD_CONTRA_RX.finditer(result or "")):
         reasons.append("model-reported hard contradiction (fail-closed hold — see staged ⚠️ notes)")
     blocks = parse_file_blocks(result)
+    heads = {}
+    for relpath, _content in blocks:
+        h = git("show", "HEAD:" + relpath)               # ONE HEAD materialization per block
+        heads[relpath] = h.stdout if h.returncode == 0 else None
+    batch_added = "\n".join(_added_text(heads[rp], c) for rp, c in blocks)
+    drop_cap = int(cfg.get("ingest", {}).get("max_dropped_threads", 2))
     known = _known_sid8s()          # v0.1.8 — engine-computed resolution set; model output can't extend it
     for relpath, content in blocks:
-        h = git("show", "HEAD:" + relpath)               # ONE HEAD materialization per block
-        head_text = h.stdout if h.returncode == 0 else None
+        head_text = heads[relpath]
         n = _tracked_page_diff_lines(head_text, content)
         if n > cap:
             reasons.append("large rewrite of tracked page %s (%d changed lines > %d)" % (relpath, n, cap))
+        dropped = _unaccounted_thread_drops(head_text, content, batch_added)
+        if dropped > drop_cap:
+            reasons.append("%d active thread(s) dropped from %s with no resolution/move recorded in "
+                           "this batch" % (dropped, relpath))
         if _elision_hits(head_text, content):
             reasons.append("elided content in tracked page %s (placeholder instead of full section — "
                            "accepting would delete it; reject)" % relpath)
@@ -3786,6 +3840,7 @@ DEFAULT_CONFIG = {
     "backfill": {"pace_seconds": 0.5},
     "ingest": {"model": MODEL_DEFAULTS["ingest"], "effort": EFFORT_DEFAULTS["ingest"], "mode": "auto", "cron": "0 20 * * *", "enabled": True,
                "max_sessions_per_run": 50, "auto_max_batches": 4, "max_selected_pages": 12,
+               "max_dropped_threads": 2,
                "stall_threshold": 20},   # WP4 ROW 3 — un-ingested backlog past this → stall banner
     #   ingest.mode: "auto" (S2-gated auto-commit) | "review" (always stage batches for human review)
     "lint":   {"model": MODEL_DEFAULTS["lint"], "effort": EFFORT_DEFAULTS["lint"], "cron": "0 20 * * 1", "enabled": True,
@@ -5088,7 +5143,7 @@ CONFIG_CONSTRAINTS = {
     "digest.recent_sessions": (0, None), "digest.max_chars": (1, None),
     "digest.max_recent_lines": (0, None),
     "reconcile.window_days": (0, None), "backfill.pace_seconds": (0, None),
-    "ingest.max_sessions_per_run": (1, None), "ingest.auto_max_batches": (1, None),
+    "ingest.max_sessions_per_run": (1, None), "ingest.max_dropped_threads": (0, None), "ingest.auto_max_batches": (1, None),
     "ingest.max_selected_pages": (1, None), "ingest.stall_threshold": (0, None),
     "lint.max_page_lines": (1, None), "lint.desc_max_chars": (1, None),
     "doctor.stale_after_days": (0, None), "doctor.probe_timeout_seconds": (1, None),
