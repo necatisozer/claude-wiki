@@ -74,6 +74,7 @@ check("elision detected on tracked page", wiki._elision_hits(HEAD, ELIDED) > 0)
 check("carried-over phrasing detected", wiki._elision_hits(HEAD, HEAD + "- (carried over — see prior entries for full list)\n") > 0)
 check("new page exempt", wiki._elision_hits(None, ELIDED) == 0)
 check("legit update not flagged", wiki._elision_hits(HEAD, HEAD.replace("- Metro DI", "- Metro DI 1.3.2 (landed 2026-07-21)")) == 0)
+check("'(diff truncated)' about source material not flagged", wiki._elision_hits(HEAD, HEAD + "- Review incomplete (diff truncated); (truncated diff) too.\n") == 0)
 check("pre-existing placeholder not re-flagged", wiki._elision_hits(ELIDED, ELIDED + "- new fact\n") == 0)
 
 sys.exit(1 if FAILS else 0)

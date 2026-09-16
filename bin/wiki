@@ -2362,8 +2362,10 @@ def _risky_shapes(text):
 # Elision placeholders: a fold that writes "(unchanged — see prior entries)" instead of re-emitting an
 # existing section silently deletes that section on accept. Only checked on TRACKED pages, and only
 # when the placeholder is NEW (absent from HEAD), so a page legitimately quoting the phrase can't loop.
+# "truncated" is deliberately NOT a marker: review notes routinely say "(diff truncated)" about the
+# SOURCE material, and flagging that held 3 of 16 legitimate folds.
 _ELISION_RX = re.compile(
-    r"(?im)\((?:[^()\n]{0,40}\b)?(?:unchanged|omitted|truncated|elided)\b[^()\n]{0,80}\)"
+    r"(?im)\((?:[^()\n]{0,40}\b)?(?:unchanged|omitted|elided)\b[^()\n]{0,80}\)"
     r"|\bsee (?:the )?(?:prior|previous|earlier) (?:entries|version|content|sections?)\b"
     r"|\brest (?:of (?:the )?(?:page|section|content) )?(?:is )?unchanged\b"
     r"|\bcontent (?:unchanged|omitted)\b")

@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.21] - 2026-09-17
+
+### Fixed
+
+- **Elision hold false positives on security-review notes.** `truncated` was
+  treated as an elision placeholder, so notes like "(diff truncated)" — which
+  describe the reviewed source material, not the page — held 3 of 16
+  legitimate folds while draining a 238-session backlog. It is no longer a
+  marker; `unchanged` / `omitted` / `elided` / "see prior entries" still hold.
+
 ## [0.1.20] - 2026-09-16
 
 ### Added
