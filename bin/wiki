@@ -74,6 +74,15 @@ HANDLED_TYPES = {"ai-title", "agent-name", "pr-link"}
 # "sonnet") so the model tracks the `claude` CLI's current pin rather than a stale date-stamped id;
 # used by BOTH config seeding (DEFAULT_CONFIG) and every cfg.get(..., <fallback>). One place to change.
 MODEL_DEFAULTS = {"record": "haiku", "ingest": "sonnet", "lint": "sonnet"}
+# Per-stage `--effort`, passed EXPLICITLY so the headless calls never inherit the user's interactive
+# `effortLevel` (an xhigh global made every ingest fold overrun its 600s timeout). Config
+# `<stage>.effort` overrides; "" / "inherit" omits the flag.
+EFFORT_DEFAULTS = {"record": "low", "ingest": "medium", "lint": "medium"}
+
+def _stage_effort(cfg, stage):
+    sc = cfg.get(stage) if isinstance(cfg.get(stage), dict) else {}
+    e = str(sc.get("effort", EFFORT_DEFAULTS[stage]) or "").strip().lower()
+    return None if e in ("", "inherit") else e
 
 # WP5 (S8) — wiki.log size cap: past this the writer rotates to wiki.log.1 (one prior generation
 # kept) so the append-only log can't grow unbounded. WIKI_LOG_MAX_BYTES overrides (tests use a tiny cap).
@@ -881,13 +890,14 @@ def _frame_untrusted(system_prompt, user_text):
     return system_prompt + guard, "%s\n%s\n%s" % (begin, user_text, end), token
 
 # ---------------------------------------------------------------- claude -p (lean)
-def _claude_argv(model, system_prompt):
+def _claude_argv(model, system_prompt, effort=None):
     """The exact `claude -p` invocation contract — ONE home, shared by call_claude and doctor's
     _claude_contract_check so the probe always tests the production invocation, never a drifted copy."""
     return ["claude", "-p", "--model", model,
             "--no-session-persistence", "--tools", "",
             "--disable-slash-commands", "--strict-mcp-config",
-            "--system-prompt", system_prompt, "--output-format", "json"]
+            "--system-prompt", system_prompt, "--output-format", "json"] \
+        + (["--effort", effort] if effort else [])
 
 def _parse_claude_envelope(stdout):
     """Last JSON-object line of `claude -p --output-format json` output, or None."""
@@ -899,11 +909,11 @@ def _parse_claude_envelope(stdout):
                 obj = json.loads(ln)
     return obj
 
-def call_claude(system_prompt, user_text, model, timeout=240):
+def call_claude(system_prompt, user_text, model, timeout=240, effort=None):
     # single LLM choke: every prompt is fenced in a per-call sentinel (WP1 ROW 1) — no path unwrapped
     system_prompt, user_text, _tok = _frame_untrusted(system_prompt, user_text)
     env = {**os.environ, "WIKI_ENGINE": "1"}
-    r = subprocess.run(_claude_argv(model, system_prompt), input=user_text,
+    r = subprocess.run(_claude_argv(model, system_prompt, effort), input=user_text,
                        capture_output=True, text=True, env=env, timeout=timeout)
     obj = _parse_claude_envelope(r.stdout)
     if not obj or obj.get("is_error"):
@@ -1202,7 +1212,8 @@ def cmd_record(args):
                 return 0
             model = cfg.get("record", {}).get("model", MODEL_DEFAULTS["record"])
             body, cost = call_claude((CODE_ROOT / "prompts" / "record.system.md").read_text(),
-                                     _neutralize_delimiters(cleaned), model)   # untrusted transcript → defang forged framing
+                                     _neutralize_delimiters(cleaned), model,
+                                     effort=_stage_effort(cfg, "record"))   # untrusted transcript → defang forged framing
             body = unescape_unicode(body)          # normalize any literal \uXXXX the model emitted
             if header.get("title"):
                 header["title"] = unescape_unicode(header["title"])
@@ -1988,7 +1999,8 @@ def _ingest_select_pages(rows, model, cfg):
     # number in the prompt made raising ingest.max_selected_pages silently ineffective.
     system = (CODE_ROOT / "prompts" / "ingest.select.system.md").read_text() \
         .replace("{{MAX_SELECTED}}", str(cap))
-    out, _cost = call_claude(system, _build_select_input(index_block, rows), model, timeout=240)
+    out, _cost = call_claude(system, _build_select_input(index_block, rows), model, timeout=240,
+                             effort=_stage_effort(cfg, "ingest"))
     return _parse_page_selection(out, paths, cap)
 
 def _build_ingest_input(rows, selected):
@@ -2020,7 +2032,8 @@ def _ingest_two_phase(rows, model, cfg):
     selected = _ingest_select_pages(rows, model, cfg)                    # phase ① (compact index → selection)
     input_text, allowlist = _build_ingest_input(rows, selected)         # phase ② input (only selected bodies)
     result, cost = call_claude((CODE_ROOT / "prompts" / "ingest.system.md").read_text(),
-                               input_text, model, timeout=600)           # phase ② (emits FILE-blocks)
+                               input_text, model, timeout=600,
+                               effort=_stage_effort(cfg, "ingest"))      # phase ② (emits FILE-blocks)
     return result, cost, allowlist, selected
 
 def _mark_ingested(text):
@@ -2346,6 +2359,22 @@ def _risky_shapes(text):
         tags.append("imperative+2nd-person")
     return tags
 
+# Elision placeholders: a fold that writes "(unchanged — see prior entries)" instead of re-emitting an
+# existing section silently deletes that section on accept. Only checked on TRACKED pages, and only
+# when the placeholder is NEW (absent from HEAD), so a page legitimately quoting the phrase can't loop.
+_ELISION_RX = re.compile(
+    r"(?im)\((?:[^()\n]{0,40}\b)?(?:unchanged|omitted|truncated|elided)\b[^()\n]{0,80}\)"
+    r"|\bsee (?:the )?(?:prior|previous|earlier) (?:entries|version|content|sections?)\b"
+    r"|\brest (?:of (?:the )?(?:page|section|content) )?(?:is )?unchanged\b"
+    r"|\bcontent (?:unchanged|omitted)\b")
+
+def _elision_hits(head_text, new_content):
+    """Elision placeholders newly introduced into a tracked page (count; 0 for new pages)."""
+    if head_text is None:
+        return 0
+    old = {m.group(0).lower() for m in _ELISION_RX.finditer(head_text)}
+    return sum(1 for m in _ELISION_RX.finditer(new_content or "") if m.group(0).lower() not in old)
+
 def _tracked_page_diff_lines(head_text, new_content):
     """Changed (added+removed) line count between the committed `head_text` and `new_content`;
     -1 when head_text is None (not git-tracked — a genuinely-new page, exempt from the diff cap)."""
@@ -2433,6 +2462,9 @@ def _ingest_hold_reason(result, cfg):
         n = _tracked_page_diff_lines(head_text, content)
         if n > cap:
             reasons.append("large rewrite of tracked page %s (%d changed lines > %d)" % (relpath, n, cap))
+        if _elision_hits(head_text, content):
+            reasons.append("elided content in tracked page %s (placeholder instead of full section — "
+                           "accepting would delete it; reject)" % relpath)
         tags = _risky_shapes(content)
         if tags:
             reasons.append("risky shapes in %s: %s" % (relpath, ", ".join(tags)))
@@ -2790,7 +2822,8 @@ def run_lint(cfg):
     cost = None
     try:
         llm_report, cost = call_claude((CODE_ROOT / "prompts" / "lint.system.md").read_text(),
-                                       user_input, model, timeout=600)
+                                       user_input, model, timeout=600,
+                                       effort=_stage_effort(cfg, "lint"))
     except Exception as e:
         log("lint LLM ERROR", repr(e))
         llm_report = "_(LLM semantic review failed: %s — deterministic findings only.)_" % e
@@ -3734,7 +3767,7 @@ GITIGNORE_REQUIRED =["state/", "logs/", "*.db", "*.db-wal", "*.db-shm", ".cache/
 DEFAULT_CONFIG = {
     "enabled": True,
     "schema_version": ENGINE_SCHEMA,   # stamped at init; the WP4 forward-compat guard reads it
-    "record": {"model": MODEL_DEFAULTS["record"], "input_max_chars": 60000, "subagent_cap": 30,
+    "record": {"model": MODEL_DEFAULTS["record"], "effort": EFFORT_DEFAULTS["record"], "input_max_chars": 60000, "subagent_cap": 30,
                "max_assistant_chars": 1200, "max_user_chars": 1500,
                # Opt-in raw-source durability: gzip-copy each kept session's transcript into the
                # untracked state/transcripts/ (Claude Code deletes the original after
@@ -3751,11 +3784,11 @@ DEFAULT_CONFIG = {
     # WP4 ROW 2 — `wiki backfill` (opt-in history seed): pace between records so a big seed doesn't
     # hammer the API. 0 = no delay.
     "backfill": {"pace_seconds": 0.5},
-    "ingest": {"model": MODEL_DEFAULTS["ingest"], "mode": "auto", "cron": "0 20 * * *", "enabled": True,
+    "ingest": {"model": MODEL_DEFAULTS["ingest"], "effort": EFFORT_DEFAULTS["ingest"], "mode": "auto", "cron": "0 20 * * *", "enabled": True,
                "max_sessions_per_run": 50, "auto_max_batches": 4, "max_selected_pages": 12,
                "stall_threshold": 20},   # WP4 ROW 3 — un-ingested backlog past this → stall banner
     #   ingest.mode: "auto" (S2-gated auto-commit) | "review" (always stage batches for human review)
-    "lint":   {"model": MODEL_DEFAULTS["lint"], "cron": "0 20 * * 1", "enabled": True,
+    "lint":   {"model": MODEL_DEFAULTS["lint"], "effort": EFFORT_DEFAULTS["lint"], "cron": "0 20 * * 1", "enabled": True,
                "max_page_lines": 160, "desc_max_chars": 120,   # WP4 ROW 5 — desc-length lint cap
                # v0.1.9 — report-only staleness: flag an ACTIVE page whose newest evidence of
                # freshness (created/updated/newest Sources date) is older than N days. Projects
@@ -5048,6 +5081,8 @@ CONFIG_RUNTIME_SCALARS = {
 CONFIG_CONSTRAINTS = {
     "schema_version": (1, None),
     "ingest.mode": {"auto", "review"},                 # enum
+    **{"%s.effort" % st: {"", "inherit", "low", "medium", "high", "xhigh", "max"}
+       for st in ("record", "ingest", "lint")},       # enum — "" / "inherit" omit --effort
     "record.input_max_chars": (1, None), "record.subagent_cap": (0, None),
     "record.max_assistant_chars": (1, None), "record.max_user_chars": (1, None),
     "digest.recent_sessions": (0, None), "digest.max_chars": (1, None),

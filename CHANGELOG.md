@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Ingest timed out on every run when the user's interactive `effortLevel` was
+  high.** The headless `claude -p` calls inherited the global `effortLevel`
+  (and `alwaysThinkingEnabled`) from `~/.claude/settings.json`; at `xhigh` the
+  phase-② fold overran its 600s timeout on batches as small as 15 sessions, so
+  auto-ingest silently failed daily and the backlog only grew. Every stage now
+  passes `--effort` explicitly — `record: low`, `ingest: medium`,
+  `lint: medium` — overridable per stage via `<stage>.effort` in config
+  (`"inherit"` omits the flag). Config validation knows the new key and its
+  allowed levels.
+
+### Added
+
+- **Elision hold.** A fold that replaces an existing section of a tracked page
+  with a placeholder (`(unchanged — see prior entries)`, `rest unchanged`, …)
+  is now held with an explicit reason — accepting it would delete that section.
+  Only placeholders newly introduced versus HEAD count, so a page that
+  legitimately quotes the phrase can't hold-loop. The ingest prompt also gains
+  a "never elide" rule.
+
 ## [0.1.18] - 2026-08-03
 
 ### Fixed
