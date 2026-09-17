@@ -199,9 +199,12 @@ print("ok 1: lint net flags poison in page + journal + long desc, masked, never 
 # A structurally CLEAN wiki (one project page → no orphan/bad-fm/unsourced/bloat/desc/poison finding),
 # so lint_open reflects ONLY the LLM [high] findings we inject via the fake review body.
 W2 = git_wiki("lintdoc_high_w_")
+# `updated` is relative to NOW: a fixed date aged past lint.stale_projects_days (60) and the v0.1.9
+# staleness finding silently turned this "structurally clean" wiki into 3 open findings (CI time bomb).
+_FRESH = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
 (W2 / "pages" / "projects" / "proj.md").write_text(
     "---\nname: Demo\ndescription: A demo project page.\ntype: project\nslug: demo\n"
-    "created: 2026-07-01\nupdated: 2026-07-06\nstatus: active\n---\n"
+    "created: 2026-07-01\nupdated: %s\nstatus: active\n---\n" % _FRESH +
     "# Demo\n## What this is\nA small demo codebase.\n## Sources\n- 2026-07-06 · ddd44444 · notes\n")
 # v0.1.8: 'structurally clean' now includes citation resolution — seed the journal entry the page cites.
 (W2 / "journal" / "2026" / "07" / "2026-07-06__notes__ddd44444.md").write_text(
