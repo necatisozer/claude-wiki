@@ -66,12 +66,25 @@ A one-way flow; each stage is bounded and gated.
 session transcripts after `cleanupPeriodDays` (a Claude Code setting, not a wiki one), so a journal
 entry's `source:` path eventually dangles. After that, a page claim can only be verified against the
 journal entry itself — an LLM-written summary, not raw data. `wiki doctor` reports how many source
-transcripts have already expired. Two opt-in archive tiers push that horizon out:
-`record.archive_transcripts` gzip-copies each kept session's RAW transcript into the untracked
-`state/transcripts/` (local only — raw pre-redaction text never enters the synced repo), and
-`record.sync_transcripts` writes a secret-REDACTED gzip copy as a tracked `transcripts/<sid>.jsonl.gz`
-that commits and pushes with the record — same trust class as the journal (nothing lands unredacted),
-readable from every synced device. Both default off.
+transcripts have already expired. Two opt-in archive keys push that horizon out, both defaulting off
+and both sharing one durable-write primitive (`_gzip_into`: temp + rename, `O_NOFOLLOW`, `0600`):
+
+- `record.archive_transcripts` — **how much** raw source to keep locally, one scope axis rather
+  than a flag per file kind, since the kinds nest (there is no coherent "keep the sidechains but
+  discard the session they hang off"):
+  - `false` — nothing.
+  - `"session"` — the kept session's RAW transcript into the untracked `state/transcripts/`.
+  - `"full"` — that plus the session's own subagent sidechains, which Claude Code writes under
+    `<project>/<sid>/`, into `state/agent-transcripts/<sid>/`. Typically the bulk of the raw source:
+    one session here holds 44 sidechains against a single transcript.
+  - Legacy `true` reads as `"session"` — the scope the key had before `"full"` existed, so an
+    upgrade never silently multiplies what a config already asked for.
+
+  Local only either way: `state/` is gitignored, so pre-redaction text never enters the synced repo.
+  A copy carries its source's mtime, so a re-record rewrites only what grew.
+- `record.sync_transcripts` — a secret-REDACTED gzip copy as a tracked `transcripts/<sid>.jsonl.gz`,
+  committed and pushed with the record. Same trust class as the journal (nothing lands unredacted),
+  readable from every synced device.
 
 Scheduling is **cron-based** and **hook-triggered**: `maintain` (detached, run from SessionStart) does
 crash-gap **reconcile**, due-based ingest (daily) and lint (weekly), and journal retention, all under
@@ -187,7 +200,7 @@ unknown keys, wrong types, and out-of-range values are **advisory** (listed, non
 | `record.subagent_cap` | `30` | Max subagent transcripts folded into one record. |
 | `record.max_assistant_chars` | `1200` | Per-assistant-turn char cap in the cleaned body. |
 | `record.max_user_chars` | `1500` | Per-user-turn char cap in the cleaned body. |
-| `record.archive_transcripts` | `false` | Local raw-source durability: gzip the raw transcript into untracked `state/transcripts/` at record time. |
+| `record.archive_transcripts` | `false` | Local raw-source durability, by scope: `false` / `"session"` (transcript → untracked `state/transcripts/`) / `"full"` (plus sidechains → `state/agent-transcripts/<sid>/`). Legacy `true` = `"session"`. |
 | `record.sync_transcripts` | `false` | Cross-device tier: redacted gzip copy in tracked `transcripts/`, synced with the repo. |
 | `digest.recent_sessions` | `12` | How many recents the digest lists. |
 | `digest.max_chars` | `4000` | Hard cap on the injected digest size. |

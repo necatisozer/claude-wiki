@@ -304,34 +304,122 @@ def _oplog(kind, detail):
     except Exception:
         pass
 
+def _gzip_into(src_path, dst, mtime=None, transform=None, max_bytes=None):
+    """The one durable-write primitive behind all three transcript tiers: gzip src_path to `dst`
+    via a same-dir temp + rename, so a reader never sees a half-written archive. O_EXCL +
+    O_NOFOLLOW on the temp and 0600 throughout, since two of the three tiers hold PRE-redaction
+    text; `_reject_symlinked_path` gates the target the same way every other WIKI write does.
+
+    `transform` None streams bytes in 1 MiB chunks; a callable runs per LINE instead (decoded text
+    in, text out) — that is the redacting tier's shape, and per-line is exact because SECRET_PATTERNS
+    are single-line. `mtime` stamps the temp BEFORE the rename, so the published copy never exists
+    carrying now(); callers compare it against the source to decide staleness. `max_bytes` refuses
+    to publish an over-large result and returns False, leaving `dst` untouched.
+
+    compresslevel 6, not gzip's default 9: measured on real sidechains, 9 costs ~1.8x the CPU of 6
+    for ~0.3% better ratio — and on the base64-heavy dirs this tier now targets, ~0% better.
+
+    Returns True when `dst` was published. Raises — callers own the non-fatal contract."""
+    import gzip
+    dst = Path(dst)
+    _reject_symlinked_path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name("." + dst.name + ".tmp")
+    with contextlib.suppress(FileNotFoundError):
+        tmp.unlink()                                  # crash leftover — O_EXCL below would refuse it
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(tmp), flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6) as gz:
+            if transform is None:
+                with open(src_path, "rb") as src:
+                    for chunk in iter(lambda: src.read(1 << 20), b""):
+                        gz.write(chunk)
+            else:
+                with open(src_path, "r", errors="replace") as src:
+                    for line in src:
+                        gz.write(transform(line).encode("utf-8"))
+        if max_bytes is not None and tmp.stat().st_size > max_bytes:
+            return False
+        if mtime is not None:
+            os.utime(tmp, (mtime, mtime))             # stamp BEFORE publish: dst never shows now()
+        os.replace(tmp, dst)
+        return True
+    finally:
+        with contextlib.suppress(Exception):
+            tmp.unlink()
+
+def _archive_mode(cfg):
+    """`record.archive_transcripts` as one scope axis: "" (off), "session", or "full".
+
+    One key rather than a boolean per tier, because the tiers are nested, not independent — there
+    is no coherent "keep the sidechains but discard the session they hang off", and a pair of
+    booleans would have spelled exactly that. Legacy `true` maps to "session", the scope that key
+    had before "full" existed, so an upgrade is never a silent 400x disk increase."""
+    v = cfg.get("record", {}).get("archive_transcripts", False)
+    if v is True:
+        return "session"
+    return v if v in ("session", "full") else ""
+
 def _archive_transcript(tpath, sid, cfg):
     """Opt-in raw-source durability (`record.archive_transcripts`): gzip-copy the session
     transcript into the UNTRACKED state/transcripts/ before Claude Code's cleanupPeriodDays
     deletes it. Local only — state/ is gitignored, so raw (pre-redaction, secret-bearing) text
-    never enters the synced repo. Same-dir temp + rename; a re-record overwrites (transcripts are
-    append-only, so newer is a superset). Never raises — archival must not fail a record."""
+    never enters the synced repo. A re-record overwrites (transcripts are append-only, so newer is
+    a superset). Never raises — archival must not fail a record."""
     try:
-        if not cfg.get("record", {}).get("archive_transcripts", False):
+        if not _archive_mode(cfg):
             return
-        import gzip
-        d = WIKI / "state" / "transcripts"
-        d.mkdir(parents=True, exist_ok=True)
-        dst, tmp = d / ("%s.jsonl.gz" % sid), d / (".%s.tmp" % sid)
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()                              # crash leftover — O_EXCL below would refuse it
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(str(tmp), flags, 0o600)
-        try:
-            with os.fdopen(fd, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb") as gz, \
-                 open(tpath, "rb") as src:
-                for chunk in iter(lambda: src.read(1 << 20), b""):
-                    gz.write(chunk)
-            os.replace(tmp, dst)
-        finally:
-            with contextlib.suppress(Exception):
-                tmp.unlink()
+        _gzip_into(tpath, WIKI / "state" / "transcripts" / ("%s.jsonl.gz" % sid))
     except Exception as e:
         log("record: transcript archive skipped (non-fatal):", repr(e))
+
+def _sidechain_paths(tpath, sid):
+    """Every subagent sidechain belonging to ONE session. Claude Code writes them under
+    `<project>/<sid>/`, so the containing directory supplies the attribution the `agent-*.jsonl`
+    filenames lack — which is why this takes a sid rather than sweeping the project dir.
+
+    Single home for that layout assumption: the cleaner's `subagents:` count (clean_transcript) and
+    the archive tier read the SAME set, so a Claude Code layout change cannot make the count a
+    journal reports disagree with what was actually archived. Deliberately not filtered to the
+    `agent-` prefix — anything the session left under its own directory is its sidechain."""
+    return sorted(glob.glob(str(Path(tpath).parent / sid / "**" / "*.jsonl"), recursive=True))
+
+def _archive_agent_transcripts(tpath, sid, cfg):
+    """The "full" half of `record.archive_transcripts`: gzip-copy THIS session's subagent
+    sidechains into the UNTRACKED state/agent-transcripts/<sid>/, same cleanup race and same
+    local-only trust class as _archive_transcript — and, because it runs from the same keep-gated
+    call site, the same classifier gate.
+
+    Each copy is stamped with its SOURCE's mtime, sampled before the read, which makes "unchanged"
+    an exact equality rather than a newer-than guess: a sidechain appended to mid-copy leaves a
+    truncated archive carrying the pre-append mtime, so the next record still sees a mismatch and
+    redoes it. Stamping at copy-completion time instead would mark the truncated copy NEWER than
+    its source and freeze it there. Never raises, and one unreadable sidechain (a cleanup deletion
+    mid-walk) skips only itself."""
+    try:
+        if _archive_mode(cfg) != "full":
+            return
+        d = WIKI / "state" / "agent-transcripts" / sid
+        copied = 0
+        for p in _sidechain_paths(tpath, sid):
+            src = Path(p)
+            try:
+                st = src.stat()
+                dst = d / ("%s.jsonl.gz" % src.stem)
+                try:
+                    if dst.stat().st_mtime == st.st_mtime:
+                        continue                      # already archived, source unchanged
+                except FileNotFoundError:
+                    pass
+                _gzip_into(src, dst, mtime=st.st_mtime)
+                copied += 1
+            except Exception as e:
+                log("record: agent transcript %s skipped (non-fatal):" % src.name, repr(e))
+        if copied:
+            log("record: archived %d agent transcript(s) for %s" % (copied, sid[:8]))
+    except Exception as e:
+        log("record: agent-transcript archive skipped (non-fatal):", repr(e))
 
 def _sync_transcript(tpath, sid, cfg):
     """Opt-in cross-device transcript copy (`record.sync_transcripts`): a SECRET-REDACTED, gzipped
@@ -343,26 +431,10 @@ def _sync_transcript(tpath, sid, cfg):
     try:
         if not cfg.get("record", {}).get("sync_transcripts", False):
             return
-        import gzip
-        d = WIKI / "transcripts"
-        d.mkdir(parents=True, exist_ok=True)
-        dst, tmp = d / ("%s.jsonl.gz" % sid), d / (".%s.tmp" % sid)
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()                              # crash leftover — O_EXCL below would refuse it
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(str(tmp), flags, 0o600)
-        try:
-            with os.fdopen(fd, "wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb") as gz, \
-                 open(tpath, "r", errors="replace") as src:
-                for line in src:                      # SECRET_PATTERNS are single-line — per-line is exact
-                    gz.write(_redact_secrets(line).encode("utf-8"))
-            if tmp.stat().st_size > 95_000_000:       # GitHub refuses files ≥100 MB — skip, keep local tiers
-                log("record: transcript sync skipped (too large for the remote)")
-                return
-            os.replace(tmp, dst)
-        finally:
-            with contextlib.suppress(Exception):
-                tmp.unlink()
+        # GitHub refuses files ≥100 MB — over the cap, publish nothing and keep the local tiers.
+        if not _gzip_into(tpath, WIKI / "transcripts" / ("%s.jsonl.gz" % sid),
+                          transform=_redact_secrets, max_bytes=95_000_000):
+            log("record: transcript sync skipped (too large for the remote)")
     except Exception as e:
         log("record: transcript sync skipped (non-fatal):", repr(e))
 
@@ -816,8 +888,7 @@ def clean_transcript(path):
     # fold subagents (final report only)
     sid = header["sessionId"]
     if sid:
-        sub_dir = path.parent / sid
-        subs = sorted(glob.glob(str(sub_dir / "**" / "*.jsonl"), recursive=True))
+        subs = _sidechain_paths(path, sid)
         header["subagents"] = len(subs)
         for sp in subs[:CFG_SUBCAP]:
             try:
@@ -1245,6 +1316,7 @@ def cmd_record(args):
                  now_iso(), trigger, page, prev_ingested_at, prev_ingested_by, None, ended[:10], title, desc))
             conn.commit()
             _archive_transcript(tpath, sid, cfg)     # opt-in raw-source durability (local, untracked)
+            _archive_agent_transcripts(tpath, sid, cfg)   # opt-in sidechain tier (local, untracked)
             _sync_transcript(tpath, sid, cfg)        # opt-in cross-device tier (redacted, tracked)
             _oplog("record", "%s %s" % (sid[:8], page))
             _record_sync_commit_push(old_page, page, slugify(title), sid)   # sync: commit+push (no-op unless enabled)
@@ -3825,9 +3897,13 @@ DEFAULT_CONFIG = {
     "schema_version": ENGINE_SCHEMA,   # stamped at init; the WP4 forward-compat guard reads it
     "record": {"model": MODEL_DEFAULTS["record"], "effort": EFFORT_DEFAULTS["record"], "input_max_chars": 60000, "subagent_cap": 30,
                "max_assistant_chars": 1200, "max_user_chars": 1500,
-               # Opt-in raw-source durability: gzip-copy each kept session's transcript into the
-               # untracked state/transcripts/ (Claude Code deletes the original after
-               # cleanupPeriodDays). Local only — never synced.
+               # Opt-in raw-source durability, HOW MUCH of it to keep (Claude Code deletes the
+               # originals after cleanupPeriodDays). Local only — never synced.
+               #   false     — keep nothing
+               #   "session" — the session transcript, into untracked state/transcripts/
+               #   "full"    — that plus its subagent sidechains, into state/agent-transcripts/<sid>/
+               # Legacy `true` reads as "session": that is what the key archived before "full"
+               # existed, so an existing config keeps its exact behaviour.
                "archive_transcripts": False,
                # Opt-in cross-device tier: a secret-REDACTED gzip copy as a tracked
                # transcripts/<sid>.jsonl.gz, committed + pushed with the record.
@@ -5138,6 +5214,8 @@ CONFIG_RUNTIME_SCALARS = {
 CONFIG_CONSTRAINTS = {
     "schema_version": (1, None),
     "ingest.mode": {"auto", "review"},                 # enum
+    # Scope enum with a legacy boolean: `true` still means "session" (see _archive_mode).
+    "record.archive_transcripts": {False, True, "session", "full"},
     **{"%s.effort" % st: {"", "inherit", "low", "medium", "high", "xhigh", "max"}
        for st in ("record", "ingest", "lint")},       # enum — "" / "inherit" omit --effort
     "record.input_max_chars": (1, None), "record.subagent_cap": (0, None),
@@ -5162,6 +5240,9 @@ def _config_schema():
         schema[k] = {sk: type(sv) for sk, sv in v.items()} if isinstance(v, dict) else type(v)
     schema.update(CONFIG_RUNTIME_SECTIONS)
     schema.update(CONFIG_RUNTIME_SCALARS)
+    # Derived types come from DEFAULT_CONFIG, which can only carry one of the two shapes this key
+    # accepts; the CONFIG_CONSTRAINTS enum above is what pins the legal values of either.
+    schema["record"]["archive_transcripts"] = (bool, str)
     return schema
 
 def _type_ok(val, expected):
@@ -5176,11 +5257,15 @@ def _type_ok(val, expected):
 def _check_value(label, dotted, val, expected):
     problems = []
     if not _type_ok(val, expected):
-        return ["%s: '%s' should be %s, got %s" % (label, dotted, expected.__name__, type(val).__name__)]
+        # `expected` is a tuple for a key that accepts more than one shape (see _config_schema).
+        want = "/".join(t.__name__ for t in expected) if isinstance(expected, tuple) else expected.__name__
+        return ["%s: '%s' should be %s, got %s" % (label, dotted, want, type(val).__name__)]
     con = CONFIG_CONSTRAINTS.get(dotted)
     if isinstance(con, set):
         if val not in con:
-            problems.append("%s: '%s'=%r not one of %s" % (label, dotted, val, sorted(con)))
+            # key=repr: an enum may mix types (record.archive_transcripts is bool|str), and a bare
+            # sorted() raises TypeError comparing them — crashing the very report meant to name them.
+            problems.append("%s: '%s'=%r not one of %s" % (label, dotted, val, sorted(con, key=repr)))
     elif isinstance(con, tuple):
         lo, hi = con
         if (lo is not None and val < lo) or (hi is not None and val > hi):

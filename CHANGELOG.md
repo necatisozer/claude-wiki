@@ -5,6 +5,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Subagent sidechain durability, as a new `"full"` scope on `record.archive_transcripts`.** Claude
+  Code writes each subagent's work to an `agent-*.jsonl` sidechain under `<project>/<sid>/`, and
+  `cleanupPeriodDays` deletes those on the same clock as the transcript — but the key only ever
+  covered the transcript itself, so on a subagent-heavy session most of the raw source expired
+  unarchived (one session here: 44 sidechains, 205 MB, against a single archived transcript).
+  `"full"` gzips that session's own sidechains into the untracked `state/agent-transcripts/<sid>/`,
+  from the same keep-gated call site — `state/` is gitignored, files are `0600`, content is
+  pre-redaction, and the classifier gate applies to both. A re-record rewrites only the sidechains
+  that grew, and one unreadable sidechain skips only itself.
+
+### Changed
+
+- **`record.archive_transcripts` is now a scope, not a boolean:** `false` / `"session"` / `"full"`.
+  Existing configs are unaffected — `true` reads as `"session"`, exactly what it archived before —
+  and the alternative, a second boolean per file kind, would have admitted "archive the sidechains
+  but discard the session they hang off" as a legal state. Config validation accepts either shape
+  and pins the legal values.
+- **All three transcript tiers now share one durable-write primitive.** `_gzip_into()` owns the
+  temp + rename, `O_EXCL`/`O_NOFOLLOW`, `0600` and symlink-refusal properties that the two local
+  archive tiers and `sync_transcripts` had been spelling out separately — the redacting tier passes a per-line `transform`, the synced tier its 95 MB cap. Two
+  consequences beyond the deduplication: the archive tiers gain the `_reject_symlinked_path` guard
+  every other WIKI write path already ran, and compression drops from gzip's default level 9 to 6,
+  measured at ~1.8x faster for ~0.3% worse ratio on real sidechains (and no measurable ratio loss on
+  the base64-heavy ones).
+- **One `_sidechain_paths()` home for Claude Code's sidechain layout**, shared by the cleaner's
+  `subagents:` count and the new archive tier, so a layout change upstream cannot make the count a
+  journal reports disagree with what was archived.
+
 ## [0.1.21] - 2026-09-17
 
 ### Fixed
