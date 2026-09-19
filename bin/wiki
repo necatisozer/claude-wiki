@@ -14,7 +14,7 @@ User commands
     doctor  [--claude-contract]              dependency + data-repo health check
   Recall / status (daily):
     query   <terms> [--limit N] [--include-journal] [--include-archive] [--json]   FTS5 keyword search over pages
-    transcript <sid8> [--raw]                print an archived session transcript (cleaned; --raw = stored JSONL)
+    transcript <sid8> [--raw] [--agents]     print a stored session transcript (cleaned; --raw = stored JSONL; --agents = list its sidechains)
     status                                   ledger + schedule + health summary
   Maintenance (fold + health):
     ingest  [--limit N] | --accept | --reject | --if-due   fold journals → pages (risk/review-gated)
@@ -410,7 +410,7 @@ def _archive_agent_transcripts(tpath, sid, cfg):
     try:
         if _archive_mode(cfg) != "full":
             return
-        d = WIKI / "state" / "agent-transcripts" / sid
+        d = _agent_archive_dir(sid)
         copied = 0
         for p in _sidechain_paths(tpath, sid):
             src = Path(p)
@@ -5384,18 +5384,30 @@ def _doctor_record_health():
     return last_ok, int(n_err or 0), last_err
 
 def _dangling_sources():
-    """(total, dangling) over the hot journal's `source:` transcript paths. Claude Code deletes
-    session transcripts after `cleanupPeriodDays`, so old paths dangle silently — after that,
-    verification bottoms out at the journal entry itself, not raw data. Doctor makes that
-    erosion visible; it is expected wear, not breakage."""
-    tot = gone = 0
+    """(total, dangling, archived) over the hot journal's `source:` transcript paths. Claude Code
+    deletes session transcripts after `cleanupPeriodDays`, so old paths dangle silently — after
+    that, verification bottoms out at the journal entry itself, not raw data. Doctor makes that
+    erosion visible; it is expected wear, not breakage.
+
+    A deleted original is NOT lost when an ARCHIVE tier still holds it: counting those as dangling
+    made the archive settings look like they did nothing, which is precisely the number a user
+    turns them on to move. Only the two copy tiers count as archived — a raw-store hit means the
+    original is simply at another path (a renamed project dir re-encodes it), which is neither
+    dangling nor evidence that archiving is doing anything."""
+    idx = _transcript_index()                 # one listing per tier, then pure lookups
+    tot = gone = archived = 0
     for p in glob.glob(str(WIKI / "journal" / "**" / "*.md"), recursive=True):
         src = parse_frontmatter(_read_capped(p, errors="replace")).get("source", "")
         if src.endswith(".jsonl"):
             tot += 1
-            if not os.path.exists(src):
+            if os.path.exists(src):
+                continue
+            rows = idx.get(_sid_of_transcript(src)) or []
+            if any(r[4] in ARCHIVE_TIERS for r in rows):
+                archived += 1
+            elif not rows:
                 gone += 1
-    return tot, gone
+    return tot, gone, archived
 
 def _scrub_scan():
     """Retro-scan the synced transcripts with the CURRENT secret patterns. Each transcripts/*.jsonl.gz
@@ -5414,7 +5426,7 @@ def _scrub_scan():
     out, total, new_cache = {}, 0, {}
     for p in sorted(glob.glob(str(WIKI / "transcripts" / "*.jsonl.gz"))):
         total += 1
-        name = os.path.basename(p)
+        name = os.path.basename(p)         # NB: also the persisted scrub-cache key — not a sid
         try:
             h = hashlib.sha256(Path(p).read_bytes()).hexdigest()
         except Exception:
@@ -5439,6 +5451,112 @@ def _scrub_scan():
         _atomic_write(cache_fp, json.dumps(new_cache, separators=(",", ":")))
     return total, out
 
+# Tier keys are a control enum, not UI copy: _dangling_sources branches on them, so rewording
+# the display strings below must never change doctor's arithmetic.
+TIER_LABELS = {"synced": "synced tier", "archive": "local archive", "raw": "Claude Code's live store"}
+ARCHIVE_TIERS = ("synced", "archive")               # the copy tiers — a raw hit is just the original
+
+def _agent_archive_dir(sid):
+    """Where `archive_transcripts: "full"` keeps one session's sidechains. One home, so the writer
+    and every reader cannot drift apart on the layout."""
+    return WIKI / "state" / "agent-transcripts" / sid
+
+def _transcript_index(glob_prefix="*"):
+    """{sid: [(mtime, rank, path, is_gz, tier)]} over every tier that can hold a session
+    transcript — ONE directory listing per tier, not one per lookup.
+
+    That shape is the point: `_dangling_sources` asks about hundreds of sids, and globbing three
+    directories per sid is quadratic in corpus size (measured on this wiki: 6,510 scandirs and
+    91 ms for 651 lookups, against 10 scandirs and 0.4 ms for the same answer — and the gap widens
+    once archiving is actually enabled and the tiers fill up)."""
+    idx = {}
+    for rank, (tier, pattern) in enumerate((
+            ("synced",  WIKI / "transcripts" / (glob_prefix + ".jsonl.gz")),
+            ("archive", WIKI / "state" / "transcripts" / (glob_prefix + ".jsonl.gz")),
+            # Depth is the sidechain exclusion here: a session transcript is always one level
+            # under a project dir, sidechains live deeper (see _sidechain_paths).
+            ("raw",     PROJECTS / "*" / (glob_prefix + ".jsonl")))):
+        for p in glob.glob(str(pattern)):
+            with contextlib.suppress(OSError):      # a tier file can vanish mid-walk
+                idx.setdefault(_sid_of_transcript(p), []).append(
+                    (os.path.getmtime(p), rank, p, tier != "raw", tier))
+    return idx
+
+def _freshest(rows):
+    """The winning copy among a sid's stored versions: freshest, with tier rank (trust) breaking
+    an mtime tie. Stated once here so no caller re-derives it from tuple ordering."""
+    return max(rows, key=lambda r: (r[0], -r[1]))
+
+def _resolve_transcript(prefix):
+    """Locate one session's transcript across every tier that can hold it, returning
+    (candidates, is_gz, tier_label) for the copy that wins.
+
+    Freshest wins, with tier order only as a tiebreak — NOT first-tier-wins. Transcripts are
+    append-only, so the newest copy is a superset, and the tiers can legitimately disagree: a
+    session that grows past `sync_transcripts`' 95 MB cap stops being uploaded while the local
+    archive keeps growing, so an earlier synced copy would otherwise shadow the complete one
+    forever. Within one record the synced write lands last, so the common case still resolves
+    to the synced tier.
+
+    The tiebreak order is trust: the synced copy is redacted and identical on every device; the
+    local archive is this machine's pre-redaction copy; Claude Code's own store is the original.
+    Both readers below redact on output, so a pre-redaction tier is safe to serve — the same
+    posture the raw store always had.
+
+    Without the middle tier, `archive_transcripts` was write-only: it spent disk keeping a copy
+    that no command would ever read back."""
+    idx = _transcript_index(prefix + "*")
+    if not idx:
+        return [], False, ""
+    if len(idx) > 1:                                # prefix spans sessions — caller reports it
+        return sorted(idx), False, ""               # the sids themselves are what a user retypes
+    _mt, _rank, p, gz, tier = _freshest(next(iter(idx.values())))
+    return [p], gz, tier
+
+def _sid_of_transcript(path):
+    """The session id a stored transcript is named for, whichever tier it came from."""
+    name = os.path.basename(path)
+    for suffix in (".jsonl.gz", ".jsonl"):
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+    return name
+
+def _original_size(path, is_gz):
+    """Uncompressed byte size, so archived and live copies are comparable. gzip stores it in the
+    trailing ISIZE field (mod 2**32 — sidechains are far under 4 GiB); falls back to the on-disk
+    size if the file is short or unreadable."""
+    if not is_gz:
+        return os.path.getsize(path)
+    try:
+        with open(path, "rb") as f:
+            f.seek(-4, os.SEEK_END)
+            return int.from_bytes(f.read(4), "little")
+    except OSError:
+        return os.path.getsize(path)
+
+def _sidechain_paths_for_sid(sid):
+    """`_sidechain_paths` for a session located by id rather than by its transcript path — the
+    entry point the read side needs, so the layout stays in that one helper."""
+    for d in sorted(glob.glob(str(PROJECTS / "*" / sid))):
+        return _sidechain_paths(Path(d).parent / ("%s.jsonl" % sid), sid)
+    return []
+
+def _sidechain_copies(sid):
+    """(name, path, is_gz, tier) per stored sidechain of one session — the read surface for what
+    `archive_transcripts: "full"` keeps. Live set from `_sidechain_paths`, so this agrees with the
+    `subagents:` count the journal recorded by construction rather than by coincidence; plus any
+    archived copy whose source Claude Code has since deleted."""
+    archived = {_sid_of_transcript(p): p
+                for p in sorted(glob.glob(str(_agent_archive_dir(sid) / "*.jsonl.gz")))}
+    rows = []
+    for p in _sidechain_paths_for_sid(sid):
+        name = Path(p).stem
+        a = archived.pop(name, None)
+        rows.append((name, a, True, "archive") if a else (name, p, False, "raw"))
+    rows.extend((name, p, True, "archive")                 # source already deleted
+                for name, p in sorted(archived.items()))
+    return rows
+
 def cmd_transcript(args):
     """Read-only drill-down: print one session's transcript by sid8/prefix — the last hop of the
     page → journal → transcript verification chain, one command instead of resolve/gunzip/eyeball.
@@ -5447,15 +5565,15 @@ def cmd_transcript(args):
     redaction matters for the raw-store fallback, whose files are PRE-redaction — a Claude session
     running this must never pull unredacted secrets into its context."""
     raw = "--raw" in args
+    agents = "--agents" in args
+    agent_sel = next((a.split("=", 1)[1] for a in args if a.startswith("--agent=")), None)
     terms = [a for a in args if not a.startswith("--")]
     if len(terms) != 1 or not re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]{3,35}", terms[0]):
-        print("usage: wiki transcript <sid8> [--raw]"); return 2
+        print("usage: wiki transcript <sid8> [--raw] [--agents] [--agent=<name>]"); return 2
     prefix = terms[0].lower()
-    cands, src_gz = sorted(glob.glob(str(WIKI / "transcripts" / (prefix + "*.jsonl.gz")))), True
-    if not cands:                          # fallback: Claude Code's raw store, inside its cleanup window
-        cands, src_gz = sorted(glob.glob(str(PROJECTS / "*" / (prefix + "*.jsonl")))), False
+    cands, src_gz, tier = _resolve_transcript(prefix)
     if not cands:
-        print("no transcript found for '%s' (synced tier or raw store)" % prefix); return 1
+        print("no transcript found for '%s' (synced tier, local archive, or raw store)" % prefix); return 1
     if len(cands) > 1:
         print("ambiguous prefix '%s' — candidates:" % prefix)
         for c in cands:
@@ -5463,6 +5581,33 @@ def cmd_transcript(args):
         return 2
     import gzip
     p = cands[0]
+    if agents or agent_sel:                # read surface for the "full" archive scope
+        sid = _sid_of_transcript(p)
+        copies = _sidechain_copies(sid)
+        if agent_sel:                      # open one sidechain: the hop the listing alone can't make
+            hits = [c for c in copies if c[0].startswith(agent_sel)]
+            if len(hits) != 1:
+                print("%s sidechain for '%s' — %s"
+                      % ("no" if not hits else "ambiguous", agent_sel,
+                         ", ".join(h[0] for h in hits) or "try --agents"))
+                return 1 if not hits else 2
+            name, sp, sgz, where = hits[0]
+            print("# %s · %s\n" % (name, TIER_LABELS[where]))
+            # Always the stored JSONL, redacted line by line: the cleaner renders a SESSION, and a
+            # sidechain's value here is the tool calls the session's own fold reduced to a summary.
+            opener = (lambda: gzip.open(sp, "rt", errors="replace")) if sgz else \
+                     (lambda: open(sp, "r", errors="replace"))
+            with opener() as f:
+                for ln in f:
+                    sys.stdout.write(_redact_secrets(ln[:1_000_000]))
+            return 0
+        print("# %d sidechain(s) for %s" % (len(copies), sid))
+        for name, sp, sgz, where in copies:
+            # ORIGINAL size for both tiers: a gzip size next to a plain one reads as a truncated
+            # archive, which is exactly the question --agents exists to answer.
+            print("  %-26s %8.1f KB  %-22s  --agent=%s"
+                  % (name, _original_size(sp, sgz) / 1024.0, TIER_LABELS[where], name))
+        return 0                           # a session with no subagents is not an error
     if raw:
         opener = (lambda: gzip.open(p, "rt", errors="replace")) if src_gz else \
                  (lambda: open(p, "r", errors="replace"))
@@ -5484,6 +5629,7 @@ def cmd_transcript(args):
     else:
         header, cleaned, _ = clean_transcript(Path(p))
     print("# %s" % (header.get("title") or os.path.basename(p)))
+    print("served from: %s" % TIER_LABELS[tier])   # two of three tiers are pre-redaction — say which
     print("sid: %s · cwd: %s · branch: %s" % (header.get("sessionId") or prefix,
                                               header.get("cwd") or "—", header.get("branch") or "—"))
     print("span: %s → %s · models: %s" % (header.get("started") or "—", header.get("ended") or "—",
@@ -5615,11 +5761,24 @@ def cmd_doctor(args):
         line("drift", True, "no unknown transcript entry types")
     # Source-transcript expiry (advisory): Claude Code's cleanupPeriodDays deletes old session
     # transcripts, after which a journal claim can only be verified against the journal itself.
-    tot, gone = _dangling_sources()
+    tot, gone, archived = _dangling_sources()
+    # `archived` is disjoint from `gone` — it is a separate clause, never "N of them".
+    kept = "; %d other(s) survive only in the archive tiers" % archived if archived else ""
     line("sources", gone == 0,
-         "all %d journal source transcript(s) still on disk" % tot if gone == 0 else
-         "%d/%d journal source transcript(s) already deleted by Claude Code's cleanupPeriodDays — "
-         "raise it in settings.json to keep raw transcripts longer" % (gone, tot))
+         "all %d journal source transcript(s) still readable%s" % (tot, kept) if gone == 0 else
+         "%d/%d journal source transcript(s) deleted by Claude Code's cleanupPeriodDays and not "
+         "archived — raise cleanupPeriodDays in settings.json, or set record.archive_transcripts%s"
+         % (gone, tot, kept))
+    # The line above recommends the archive tiers; this one says what they cost, so the trade is
+    # visible in the same report. Nothing prunes them — that is deliberate for a durability
+    # feature, and all the more reason to show the number.
+    sess = glob.glob(str(WIKI / "state" / "transcripts" / "*.jsonl.gz"))
+    side = glob.glob(str(WIKI / "state" / "agent-transcripts" / "*" / "*.jsonl.gz"))
+    if sess or side:
+        mb = sum(os.path.getsize(f) for f in sess + side
+                 if os.path.exists(f)) / (1024.0 * 1024.0)
+        line("archive", True, "%d session + %d sidechain cop(ies) on disk, %.0f MB (local, never "
+                              "synced, never pruned)" % (len(sess), len(side), mb))
     # Retro-scrub (advisory): synced transcripts were redacted with UPLOAD-DAY patterns; re-scan
     # with today's so pattern improvements retroactively audit old uploads. Classes + sid8s only —
     # matched text is never printed.

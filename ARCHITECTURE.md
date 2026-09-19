@@ -178,11 +178,22 @@ the engine**; **stage-then-promote every write**. Concretely:
 - `log.md` — append-only operations log (one `- <utc-iso> · <kind> · <detail>` line per
   record/ingest/lint/retention pass; engine-written, committed with each operation).
 - `transcripts/` — opt-in (`record.sync_transcripts`) redacted, gzipped transcript copies, tracked
-  and synced; read back by `wiki transcript <sid8>`.
+  and synced. `wiki transcript <sid8>` resolves across all three tiers in order — this one, then the
+  untracked `state/transcripts/`, then Claude Code's own store — freshest copy winning, tier order
+  breaking a tie, so an archived session stays readable after `cleanupPeriodDays` deletes the
+  original and a synced copy frozen by the 95 MB cap cannot shadow a growing archive. `wiki doctor`
+  counts such a session as archived rather than dangling. `--agents` lists that session's stored
+  sidechains and `--agent=<name>` prints one — the only way to see a subagent's own tool calls,
+  since the cleaner folds sidechains to their final report.
 - `config.json` — settings (synced). `state/config.local.json` — per-device overrides (untracked;
   holds the `sync` block). `SCHEMA.md` — data-repo copy is author residue, not read.
-- `state/` — local, rebuildable: the ledger (sqlite), locks, run-stamps, `push_blocked`, `drift.json`;
-  gitignored. `logs/wiki.log` — engine log (size-capped, one rotation).
+- `state/` — local, gitignored. Rebuildable: the ledger (sqlite), locks, run-stamps, `push_blocked`,
+  `drift.json`. **Not** rebuildable, and the one exception to that rule: `state/transcripts/` and
+  `state/agent-transcripts/<sid>/`, the archive tiers — once Claude Code's `cleanupPeriodDays`
+  deletes an original, the copy here is the only one in existence, so a "wipe state and reindex"
+  recovery destroys raw source that nothing can regenerate. Nothing prunes them either; that is
+  deliberate for a durability feature, and `wiki doctor` reports their size.
+  `logs/wiki.log` — engine log (size-capped, one rotation).
 
 ## Configuration reference
 

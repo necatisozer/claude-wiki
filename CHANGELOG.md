@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The archive tiers are readable.** `record.archive_transcripts` kept copies that no command
+  would open: `wiki transcript` resolved only the synced tier and Claude Code's live store, and
+  `wiki doctor` counted an archived session's deleted original as dangling — so the one number a
+  user enables archiving to move never moved.
+  - `_resolve_transcript()` walks synced / local archive / raw store, **freshest copy winning**
+    with tier order only breaking a tie. Not first-tier-wins: a session past `sync_transcripts`'
+    95 MB cap stops being uploaded while the local archive keeps growing, so an earlier synced
+    copy would otherwise shadow the complete one forever. Both readers redact on output, so
+    serving a pre-redaction tier is the posture the raw store always had; the resolved tier is
+    now printed as `served from:`, since two of the three are pre-redaction.
+  - `wiki transcript <sid8> --agents` lists a session's stored sidechains (sizes uncompressed, so
+    an archived copy is comparable to a live one) and `--agent=<name>` prints one. Without that
+    second half the sidechain tier had an inventory but no reader — and it is the only place a
+    subagent's own tool calls survive, since the cleaner folds sidechains to their final report.
+  - `wiki doctor` reports archived separately from lost, and gained an `archive` line stating what
+    the tiers cost on disk — the `sources` line recommends them, so the price belongs in the same
+    report. Nothing prunes them, which is deliberate for a durability feature.
+  - Resolution builds one index per tier rather than globbing three directories per lookup, which
+    would have made doctor's cost quadratic in wiki age. Measured on a 673-entry journal with 651
+    dangling sources: the whole sources check is 13 ms, against 106 ms for the per-lookup shape
+    and 12 ms for the old `os.path.exists`-only check that answered less.
+
 - **Subagent sidechain durability, as a new `"full"` scope on `record.archive_transcripts`.** Claude
   Code writes each subagent's work to an `agent-*.jsonl` sidechain under `<project>/<sid>/`, and
   `cleanupPeriodDays` deletes those on the same clock as the transcript — but the key only ever
