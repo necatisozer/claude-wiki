@@ -124,7 +124,11 @@ When `lint-report.md` has findings (surfaced in the digest + `wiki status`), the
 3. **Fixes only what the user directs** — verifying each flagged claim against its source journal (by
    `sessionId`) first, then committing per fix. When the journal line isn't enough,
    `wiki transcript <sid8>` prints the underlying session's cleaned, redacted transcript
-   (`--raw` for the stored JSONL) — the deepest verification hop available.
+   (`--raw` for the stored JSONL). It reads whichever tier still holds the session: the synced copy,
+   this device's archive, or Claude Code's own store, and says which in a `served from:` line.
+   When the claim came from a subagent, `--agents` lists that session's stored sidechains and
+   `--agent=<name>` prints one — the deepest hop available, and the only place a subagent's own
+   tool calls survive, since the cleaner folds sidechains to their final report.
 
 The report's **Suggested questions** section is not a findings list: the questions are prompts for
 the *user* to answer ("is thread X still real?"), never work items for the session to act on
