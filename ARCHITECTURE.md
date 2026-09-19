@@ -200,7 +200,7 @@ unknown keys, wrong types, and out-of-range values are **advisory** (listed, non
 | `record.subagent_cap` | `30` | Max subagent transcripts folded into one record. |
 | `record.max_assistant_chars` | `1200` | Per-assistant-turn char cap in the cleaned body. |
 | `record.max_user_chars` | `1500` | Per-user-turn char cap in the cleaned body. |
-| `record.archive_transcripts` | `false` | Local raw-source durability, by scope: `false` / `"session"` (transcript → untracked `state/transcripts/`) / `"full"` (plus sidechains → `state/agent-transcripts/<sid>/`). Legacy `true` = `"session"`. |
+| `record.archive_transcripts` | `"off"` | Local raw-source durability, by scope: `"off"` / `"session"` (transcript → untracked `state/transcripts/`) / `"full"` (plus sidechains → `state/agent-transcripts/<sid>/`). `false`/`true` are legacy aliases for `"off"`/`"session"`. |
 | `record.sync_transcripts` | `false` | Cross-device tier: redacted gzip copy in tracked `transcripts/`, synced with the repo. |
 | `digest.recent_sessions` | `12` | How many recents the digest lists. |
 | `digest.max_chars` | `4000` | Hard cap on the injected digest size. |

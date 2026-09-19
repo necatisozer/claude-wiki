@@ -350,15 +350,25 @@ def _gzip_into(src_path, dst, mtime=None, transform=None, max_bytes=None):
             tmp.unlink()
 
 def _archive_mode(cfg):
-    """`record.archive_transcripts` as one scope axis: "" (off), "session", or "full".
+    """`record.archive_transcripts` as one scope axis. Three settings, spelled as strings:
+
+        "off"      keep nothing
+        "session"  the session transcript  -> untracked state/transcripts/
+        "full"     that plus its subagent sidechains -> state/agent-transcripts/<sid>/
 
     One key rather than a boolean per tier, because the tiers are nested, not independent — there
     is no coherent "keep the sidechains but discard the session they hang off", and a pair of
-    booleans would have spelled exactly that. Legacy `true` maps to "session", the scope that key
-    had before "full" existed, so an upgrade is never a silent 400x disk increase."""
-    v = cfg.get("record", {}).get("archive_transcripts", False)
+    booleans would have spelled exactly that.
+
+    `false`/`true` are accepted as legacy aliases for "off"/"session" and are no longer the
+    documented spelling: four values for three behaviours read as a puzzle. `true` deliberately
+    means "session", the scope that key had before "full" existed, so an upgrade is never a
+    silent 400x disk increase."""
+    v = cfg.get("record", {}).get("archive_transcripts", "off")
     if v is True:
         return "session"
+    if v is False:
+        return ""
     return v if v in ("session", "full") else ""
 
 def _archive_transcript(tpath, sid, cfg):
@@ -3902,9 +3912,10 @@ DEFAULT_CONFIG = {
                #   false     — keep nothing
                #   "session" — the session transcript, into untracked state/transcripts/
                #   "full"    — that plus its subagent sidechains, into state/agent-transcripts/<sid>/
-               # Legacy `true` reads as "session": that is what the key archived before "full"
-               # existed, so an existing config keeps its exact behaviour.
-               "archive_transcripts": False,
+               #   "off"     — keep nothing
+               # `false`/`true` still work as legacy aliases for "off"/"session", so an existing
+               # config keeps its exact behaviour; new configs should use the strings.
+               "archive_transcripts": "off",
                # Opt-in cross-device tier: a secret-REDACTED gzip copy as a tracked
                # transcripts/<sid>.jsonl.gz, committed + pushed with the record.
                "sync_transcripts": False},
@@ -5214,8 +5225,8 @@ CONFIG_RUNTIME_SCALARS = {
 CONFIG_CONSTRAINTS = {
     "schema_version": (1, None),
     "ingest.mode": {"auto", "review"},                 # enum
-    # Scope enum with a legacy boolean: `true` still means "session" (see _archive_mode).
-    "record.archive_transcripts": {False, True, "session", "full"},
+    # Scope enum; `false`/`true` are legacy aliases for "off"/"session" (see _archive_mode).
+    "record.archive_transcripts": {"off", "session", "full", False, True},
     **{"%s.effort" % st: {"", "inherit", "low", "medium", "high", "xhigh", "max"}
        for st in ("record", "ingest", "lint")},       # enum — "" / "inherit" omit --effort
     "record.input_max_chars": (1, None), "record.subagent_cap": (0, None),
