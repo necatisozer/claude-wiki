@@ -14,7 +14,12 @@ def main():
     for t in tests:
         t0 = time.time()
         try:
-            r = subprocess.run([sys.executable, str(t)], cwd=str(ROOT),
+            # stdin=DEVNULL, not inherited: several engine subcommands read stdin when it is not a
+            # tty (read_stdin_json does a blocking sys.stdin.read() — that is the hook payload
+            # contract). A test driving one of those inherits the runner's stdin, so running the
+            # suite from a shell whose stdin is an open-but-empty pipe hangs the test until this
+            # timeout instead of failing. DEVNULL gives every test an immediate EOF.
+            r = subprocess.run([sys.executable, str(t)], cwd=str(ROOT), stdin=subprocess.DEVNULL,
                                capture_output=True, text=True, timeout=600)
             ok, out, err = r.returncode == 0, r.stdout, r.stderr
         except subprocess.TimeoutExpired as e:
