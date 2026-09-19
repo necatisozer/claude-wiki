@@ -71,8 +71,12 @@ def enable_sync(wiki, branch="main", auto_push=True):
 
 def run(args, wiki, input=None):
     env = {**os.environ, "WIKI_HOME": str(wiki)}
+    # No `input` means the engine must still get an immediate EOF rather than this process's stdin:
+    # subcommands that read a hook payload block on a non-tty stdin, which hangs a test run from a
+    # shell whose stdin is an open pipe. (`input` and `stdin` are mutually exclusive.)
+    kw = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
     return subprocess.run([sys.executable, ENGINE] + args, capture_output=True,
-                          text=True, env=env, input=input)
+                          text=True, env=env, **kw)
 
 def commit_file(wiki, rel, content, msg="c"):
     p = wiki / rel
