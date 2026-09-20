@@ -171,7 +171,10 @@ r = run(["lint"], W1, result_file=benign_body)
 assert r.returncode == 0, r.stdout + r.stderr
 report = (W1 / "lint-report.md").read_text()
 
-assert "poison.md(" in report and "secret" in report and "injection" in report, \
+# v0.1.27 — the generic "injection" tag was split into the specific HARD classes it stood for
+# (secret / leak / instruction-override), so the assertion names those instead. Same detection,
+# a more precise report: the ambiguous shapes moved to their own informational line.
+assert "poison.md(" in report and "secret" in report and "instruction-override" in report, \
     "the poisoned PAGE must be reported with its failure classes:\n" + report
 assert "2026-07-03__poison__aaaa1111.md(" in report, \
     "the poisoned JOURNAL entry must be reported by the detection net:\n" + report

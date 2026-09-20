@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The lint net separates HARD shapes from AMBIGUOUS ones; only the hard ones count.** Measured on a
+  351-file corpus: 27 files carried `curl`/`wget` or an imperative+URL and **all 27 were false
+  positives** — an install note (`curl -fsSL https://…/install.sh | sh`), an HTTP-client description,
+  network verification — against **0** hard hits. The banner therefore read a constant 27, and a
+  constant banner is furniture: it is what hides the first real hit. `secret`, `leak` and
+  `instruction-override` still count and still drive the banner; `attack-verb` and `imperative+url`
+  are now reported on their own informational line, the same treatment dangling links already get.
+  Nothing is detected less — `_lint_shape_tags` returns both buckets and the report prints both.
+  The generic `injection` tag is gone in favour of the specific class it stood for.
+- **The WRITE gate is deliberately untouched.** `_risky_shapes`, the ingest hold and
+  `classify_record` keep their wider net: a hold is reviewable and recoverable, a missed write is
+  not. Only lint's arithmetic changed.
+
 ## [0.1.26] - 2026-09-20
 
 ### Fixed

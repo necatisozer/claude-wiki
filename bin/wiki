@@ -3004,22 +3004,39 @@ def _spawn_detached(argv, stdout=None):
 #              the ONLY retroactive scan over content already on the remote (the push gate scans
 #              only new commits), so narrowing here left old credentials permanently undetectable.
 #   leak:      the same structural CoT/tool-transcript scaffold check (_LEAK_RX is already precise).
+# The shapes _risky_shapes can return, split by what they are worth in a LANDED-CONTENT net.
+# HARD = measured at zero false positives on this corpus: a credential, a leaked system prompt, or
+# an explicit "ignore previous instructions". SOFT = an ambiguous shape that legitimate engineering
+# prose produces constantly — `curl -fsSL https://…/install.sh | sh` in an install note, "run X, see
+# https://…" in a convention. Measured 2026-09-20 on a 351-file corpus: 27 files carried a soft
+# shape and ALL 27 were false positives, against 0 hard hits. A banner that always reads 27 is not a
+# signal, it is furniture — and furniture is what hides the first real hit.
+# imperative+2nd-person stays OUT: it is write-gate-only by design and lint never reported it,
+# so listing it now would grow the report without adding a surface anyone asked for.
+_LINT_SOFT_SHAPES = ("attack-verb", "imperative+url")
+
 def _lint_shape_tags(text):
-    """WP4 ROW 3 — DETECTION NET over content that ALREADY landed (pages + journal). Returns a
-    CONTENT-FREE list of failure CLASS words (never the matched text): 'secret', 'injection', 'leak'.
-    ONE _risky_shapes pass supplies both classes (see the rationale above): 'secret' is its
-    secret/PII tag (the full scan_secrets net), 'injection' is any other tag except the write-gate-
-    only imperative+2nd-person. Lint only REPORTS; it never edits or deletes (detection, not
-    enforcement) — the security gate does the enforcing."""
+    """WP4 ROW 3 — DETECTION NET over content that ALREADY landed (pages + journal). Returns
+    (hard_tags, soft_tags), both CONTENT-FREE class words, never the matched text.
+
+    Hard tags ('secret', 'leak', 'instruction-override') count as open findings. Soft tags
+    ('attack-verb', 'imperative+url') are REPORTED but not counted — the same treatment dangling
+    links already get, and for the same reason: informational, not actionable. Nothing is detected
+    less; only the arithmetic behind the banner changed. The WRITE gate (_risky_shapes, the ingest
+    hold, classify_record) is deliberately untouched — enforcement keeps its wider net, because a
+    hold is reviewable and recoverable while a missed write is not."""
     shapes = _risky_shapes(text or "")
-    tags = []
+    hard, soft = [], []
     if "secret/PII" in shapes:
-        tags.append("secret")
-    if any(t not in ("secret/PII", "imperative+2nd-person") for t in shapes):
-        tags.append("injection")
+        hard.append("secret")
+    if "instruction-override" in shapes:
+        hard.append("instruction-override")
     if _LEAK_RX.search(text or ""):
-        tags.append("leak")
-    return tags
+        hard.append("leak")
+    for t in shapes:
+        if t in _LINT_SOFT_SHAPES:
+            soft.append(t)
+    return hard, soft
 
 def _page_freshness_age(fm, text, today):
     """v0.1.9 — days since the page's newest evidence of freshness: the max of frontmatter
@@ -3064,6 +3081,7 @@ def lint_deterministic():
     inbound = {s: set() for s in slugs}
     f = {"dangling": [], "orphans": [], "bad_fm": [], "unsourced": [], "bloat": [], "contradicted": [],
          "dup_title": [], "desc_long": [], "poison": [],   # WP4 ROW 5 (desc_long) + ROW 3 (poison net)
+         "poison_soft": [],                                # ambiguous shapes: reported, NOT counted
          "bad_cite": [], "homonym": [],                    # v0.1.8 — citation resolution + identity net
          "stale": []}                                      # v0.1.9 — report-only page staleness
     known_sids = _known_sid8s()                            # v0.1.8 — one filename glob for the whole sweep
@@ -3095,9 +3113,11 @@ def lint_deterministic():
         if len(desc) > desc_cap:
             f["desc_long"].append("%s(%dc)" % (slug, len(desc)))
         # WP4 ROW 3 — detection net over the page body.
-        tags = _lint_shape_tags(pg["text"])
-        if tags:
-            f["poison"].append("%s(%s)" % (pg["path"], ",".join(tags)))
+        hard, soft = _lint_shape_tags(pg["text"])
+        if hard:
+            f["poison"].append("%s(%s)" % (pg["path"], ",".join(hard)))
+        if soft:
+            f["poison_soft"].append("%s(%s)" % (pg["path"], ",".join(soft)))
         # v0.1.8 — citation resolution over LANDED pages: (a) every cited sid8 must resolve to a
         # journal entry; (b) every `- ` bullet under ## Sources must be citation-shaped or the
         # engine's archive pointer — a homoglyph separator / 9-hex token / malformed date would
@@ -3151,16 +3171,20 @@ def lint_deterministic():
     for jp in sorted(glob.glob(str(WIKI / "journal" / "**" / "*.md"), recursive=True)):
         if _under_journal_archive(jp):
             continue
-        tags = _lint_shape_tags(_read_capped(jp, errors="replace"))
-        if tags:
-            f["poison"].append("%s(%s)" % (os.path.relpath(jp, WIKI), ",".join(tags)))
+        hard, soft = _lint_shape_tags(_read_capped(jp, errors="replace"))
+        rel_jp = os.path.relpath(jp, WIKI)
+        if hard:
+            f["poison"].append("%s(%s)" % (rel_jp, ",".join(hard)))
+        if soft:
+            f["poison_soft"].append("%s(%s)" % (rel_jp, ",".join(soft)))
     rep = ["### Structural checks (deterministic)"]
     for label, key in (("Dangling links (informational — write-later stubs)", "dangling"),
                        ("Orphan topics (no inbound links)", "orphans"),
                        ("Bad frontmatter", "bad_fm"), ("Missing ## Sources", "unsourced"),
                        ("Bloat (> %d lines)" % maxlines, "bloat"),
                        ("Over-long descriptions (> %d chars)" % desc_cap, "desc_long"),
-                       ("Poison shapes (leak/injection/secret — detection net)", "poison"),
+                       ("Poison shapes (secret/leak/instruction-override — detection net)", "poison"),
+                       ("Ambiguous shapes (informational — curl/wget, imperative+URL)", "poison_soft"),
                        ("Unresolvable/malformed citations (no matching journal entry)", "bad_cite"),
                        ("Near-homonym page identities (likely same concept)", "homonym"),
                        ("Stale pages (no fresh source/update in the window — re-verify or archive)", "stale"),
@@ -3175,6 +3199,9 @@ def _lint_open_count(f):
     # v0.1.8 provenance/identity findings (bad_cite, homonym): a broken citation is a provenance
     # break, not a write-later stub. `stale` (v0.1.9) counts too: it is actionable (re-verify →
     # bump updated:, or archive) and exists to be seen, not to decorate the report.
+    # `poison_soft` is deliberately ABSENT: curl/wget and imperative+URL are what engineering prose
+    # looks like (27 of 27 false positives when measured), so counting them made the banner a
+    # constant, and a constant banner is one nobody reads on the day it finally means something.
     return sum(len(f[k]) for k in ("orphans", "bad_fm", "unsourced", "bloat", "contradicted",
                                    "dup_title", "desc_long", "poison", "bad_cite", "homonym", "stale"))
 
