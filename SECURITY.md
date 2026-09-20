@@ -31,7 +31,7 @@ has no independent copy to check against. Security-conscious users should **down
 first, inspect it, and run it locally**:
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.21/install.sh
+curl -fsSLO https://raw.githubusercontent.com/necatisozer/claude-wiki/v0.1.22/install.sh
 # read install.sh, then:
 bash install.sh
 ```
