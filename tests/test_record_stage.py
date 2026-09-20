@@ -280,6 +280,48 @@ check("drain --dry-run: counts the staged session", "WOULD summarize 1 staged se
 check("drain --dry-run: makes no model call", not TRIP3.exists())
 check("drain --dry-run: leaves the session staged", ledger_row(W1, SID1, ["status"])[0] == "staged")
 
+# ---- (10b) a session that ERRORS mid-drain stays in the drain queue -------------------------------
+# Regression: the drain selected status='staged' only, so a summarization that failed (provider
+# outage, expired login) dropped the session out of the queue — recoverable only via the transcript
+# ENUMERATOR, which cannot see a session whose raw transcript has expired even when the archive is
+# right there. Observed live on a second machine whose `claude` login had lapsed.
+H6, W6 = mkdtemp("stage_home6_"), mkdtemp("stage_wiki6_")
+write_config(W6, STAGE_CFG)
+sid6 = "11111111-2222-4333-8444-555555555556"
+t6 = write_transcript(H6, sid6, "/work/demo", "widget")
+run_engine(["record", "--session", sid6, "--transcript", str(t6), "--cwd", "/work/demo"],
+           W6, home=H6)
+check("drain-retry: staged to begin with", ledger_row(W6, sid6, ["status"])[0] == "staged")
+run_engine(["backfill", "--drain"], W6, home=H6, fail=True)      # the model call fails
+check("drain-retry: a failed drain marks it errored", ledger_row(W6, sid6, ["status"])[0] == "error")
+os.unlink(str(t6))                       # and now the raw transcript expires — archive only
+r = run_engine(["backfill", "--drain"], W6, home=H6)             # model works again
+row = ledger_row(W6, sid6, ["status", "summarized_at", "page_path"])
+check("drain-retry: the next drain picks the errored session back up",
+      row[1] is not None and row[2] is not None)
+check("drain-retry: recovered from the archive alone", row[0] != "error")
+
+# ---- (10c) replaying an archive must not RE-archive it (gzip-in-gzip corruption) -----------------
+# The drain feeds cmd_record a stored copy; capture-before-summarize would then gzip that gzip. The
+# next read decompresses to gzip bytes instead of JSONL, the cleaner yields nothing, and the session
+# is written off as "empty (no content)" with its real content one layer down. 12 archives on a live
+# machine were corrupted this way before the guard existed.
+H7, W7 = mkdtemp("stage_home7_"), mkdtemp("stage_wiki7_")
+write_config(W7, STAGE_CFG)
+sid7 = "11111111-2222-4333-8444-555555555557"
+t7 = write_transcript(H7, sid7, "/work/demo", "cogwheel")
+run_engine(["record", "--session", sid7, "--transcript", str(t7), "--cwd", "/work/demo"],
+           W7, home=H7)
+arch7 = Path(W7) / "state" / "transcripts" / (sid7 + ".jsonl.gz")
+size_before = arch7.stat().st_size
+os.unlink(str(t7))                      # force the drain to read the archive
+run_engine(["backfill", "--drain"], W7, home=H7)
+with gzip.open(str(arch7), "rb") as fh:
+    inner = fh.read()
+check("archive: one gzip layer after a drain replays it", inner[:2] != b"\x1f\x8b")
+check("archive: still decodes to JSONL", inner.lstrip()[:1] == b"{")
+check("archive: byte size unchanged by the replay", arch7.stat().st_size == size_before)
+
 # ---- (11) capture-before-summarize: a FAILED model call still archives ---------------------------
 H4, W4 = mkdtemp("stage_home4_"), mkdtemp("stage_wiki4_")
 write_config(W4, {"enabled": True, "record": {"mode": "llm", "archive_transcripts": "session"},

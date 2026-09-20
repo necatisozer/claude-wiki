@@ -1204,11 +1204,21 @@ def _ledger_transcript_path(sid):
     finally:
         conn.close()
 
-def _staged_rows(conn, limit=None):
+def _staged_rows(conn, limit=None, include_errors=False):
     """Staged sessions, OLDEST-FIRST — the drain order, so a backlog is worked through in the same
-    chronological order a live recorder would have produced."""
+    chronological order a live recorder would have produced.
+
+    `include_errors` widens it to status='error', which is what the DRAIN wants: a staged session
+    whose summarization failed (a provider outage, an expired login) flips to 'error' and would
+    otherwise fall out of the queue entirely, recoverable only through the transcript ENUMERATOR —
+    which cannot see a session whose raw transcript has since expired, even when the archive
+    staging forced on is sitting right there. Reconcile already retries 'error' rows, so retrying
+    them here changes no policy; it just reaches the ones only the archive still holds. The count
+    and banner keep the narrow view (_staged_stats), since an errored session is reported by
+    doctor's own rec-errors line and should not inflate "awaiting summary"."""
+    where = "status IN ('staged','error')" if include_errors else "status='staged'"
     q = ("SELECT session_id, transcript_path, project, date FROM sessions "
-         "WHERE status='staged' ORDER BY COALESCE(date,''), first_seen")
+         "WHERE %s ORDER BY COALESCE(date,''), first_seen" % where)
     if limit is not None:
         q += " LIMIT %d" % int(limit)
     return conn.execute(q).fetchall()
@@ -1454,8 +1464,15 @@ def cmd_record(args):
             # that is already on this disk, so running them before the classifier verdict widens no
             # trust boundary; the excluded-project gate still fires far above, and the TRACKED
             # (pushed) _sync_transcript tier deliberately stays behind the verdict, below.
-            _archive_transcript(tpath, sid, cfg)     # opt-in raw-source durability (local, untracked)
-            _archive_agent_transcripts(tpath, sid, cfg)   # opt-in sidechain tier (local, untracked)
+            # …unless the SOURCE already is an archive. The drain replays a stored copy
+            # (_staged_source → _resolve_transcript, freshest tier wins, which after a first archive
+            # write is the archive itself), and archiving that would gzip a gzip: the next read
+            # decompresses to gzip bytes rather than JSONL, the cleaner yields nothing, and the
+            # session is written off as "empty (no content)" with its real content one layer down.
+            # Observed in production on 12 archives before this guard existed.
+            if not str(tpath).endswith(".gz"):
+                _archive_transcript(tpath, sid, cfg)     # opt-in raw-source durability (local, untracked)
+                _archive_agent_transcripts(tpath, sid, cfg)   # opt-in sidechain tier (local, untracked)
             if _record_mode(cfg) == "stage" and not force_llm:
                 return _stage_session(conn, sid, project, tpath, header, cleaned, stats, mtime,
                                       trigger, cfg, prev_ingested_at, prev_ingested_by)
@@ -3437,7 +3454,7 @@ def drain_staged(cfg, limit=None, dry=False):
     retrying it forever."""
     conn = ledger()
     try:
-        rows = _staged_rows(conn, limit)
+        rows = _staged_rows(conn, limit, include_errors=True)
     finally:
         conn.close()
     if not rows:

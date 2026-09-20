@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A drain that replayed an archive re-archived it, gzipping a gzip.** Capture-before-summarize
+  (0.1.22) archives the source before the model call, and the drain feeds `cmd_record` a STORED
+  copy — after the first archive write, `_resolve_transcript`'s freshest-wins rule makes the
+  archive itself the winning tier, so the drain read the archive and then archived that. The next
+  read decompressed to gzip bytes rather than JSONL, the cleaner yielded nothing, and the session
+  was written off as `empty (no content)` with its real content one layer down. Found on a live
+  machine: 12 corrupted archives, all recoverable by decompressing once (the inner stream is
+  intact). `cmd_record` now skips the archive step when the source already ends in `.gz` — there is
+  nothing new to capture from a copy that is already the capture.
+
+### Added
+
+- **The drain retries errored sessions, not just staged ones.** A staged session whose
+  summarization failed — a provider outage, an expired login — flipped to `status='error'` and fell
+  out of the drain queue, recoverable only through the transcript ENUMERATOR, which cannot see a
+  session whose raw transcript has expired even when the archive is sitting right there. Reconcile
+  already retries `error` rows, so this changes no policy; it just reaches the ones only the
+  archive still holds. The staged COUNT and the digest banner keep the narrow view, since an
+  errored session is already reported by doctor's `rec-errors` line.
+
 ## [0.1.24] - 2026-09-20
 
 ### Added
