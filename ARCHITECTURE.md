@@ -235,7 +235,7 @@ unknown keys, wrong types, and out-of-range values are **advisory** (listed, non
 | `reconcile.enabled` | `true` | Auto crash-gap catch-up in `maintain`. |
 | `reconcile.window_days` | `14` | How far back reconcile scans (0 = no cap). |
 | `backfill.pace_seconds` | `0.5` | Delay between records during a history seed or a staged drain. |
-| `backfill.auto` | `false` | Drain the staged backlog on `backfill.cron` from `maintain`. Off = drain by hand. |
+| `backfill.auto` | `false` | Drain the staged backlog on `backfill.cron` from `maintain`. Off = drain by hand. A sub-setting of staging: with `record.mode: "llm"` nothing is ever staged, so this key does nothing on its own. |
 | `backfill.cron` | `0 20 * * *` | Drain schedule (local time, 5-field cron), used only when `auto`. |
 | `backfill.max_per_run` | `20` | Cap on staged sessions summarized per scheduled drain. |
 | `backfill.warn_backlog` | `50` | Staged backlog past this → the digest's staged banner escalates to ⚠. `0` = off. |
