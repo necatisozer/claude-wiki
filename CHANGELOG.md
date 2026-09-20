@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **One orphaned ledger row blocked ALL ingest, permanently.** A row can outlive its journal file —
+  a record whose journal write landed but whose commit never did (sync broken at that moment), a
+  restore, a manual cleanup. `_neutralized_journal_entries` then raised `FileNotFoundError` and took
+  down the whole batch, and because the batch is rebuilt identically on every run, ingest could
+  never make progress again. It now skips the missing entry, logs which one, and folds the batch's
+  healthy neighbours — mirroring the "never allowlist a phantom" guard the page side already had.
+- **An orphaned row would then have been marked ingested.** The post-fold race guard compared
+  `_journal_mtime_ns(pp) == read_mtimes[sid]`, and a missing file reads `None` at both ends, so the
+  comparison passed and the ledger recorded that the session's content had reached the pages when
+  the fold never saw a byte of it. The guard now requires a real mtime, so an orphan stays pending
+  and visible in the stall count until its entry is rebuilt from the transcript — the only thing
+  that can honestly clear it.
+
 ## [0.1.25] - 2026-09-20
 
 ### Fixed

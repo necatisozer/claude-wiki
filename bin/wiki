@@ -2261,8 +2261,18 @@ def _neutralized_journal_entries(rows):
     own '===== NEW JOURNAL ENTRY =====' framing. Shared verbatim by BOTH ingest phases."""
     entries = []
     for sid, page in rows:
+        fp = WIKI / page
+        if not fp.exists():
+            # A ledger row can outlive its file: a record whose journal write landed but whose
+            # commit never did (sync broken at that moment), a restore, a manual cleanup. Skipping
+            # is the only safe answer — raising here took down the WHOLE batch, and since the batch
+            # is rebuilt identically on every run, one orphaned row blocked ingest permanently.
+            # Mirrors _build_ingest_input's "never allowlist a phantom" guard on the page side.
+            log("ingest: journal entry missing for %s (%s) — skipping it in this batch"
+                % (sid[:8], page))
+            continue
         entries.append("===== NEW JOURNAL ENTRY (%s) =====\n%s"
-                       % (sid[:8], _neutralize_delimiters(_read_capped(WIKI / page, errors="replace"))))
+                       % (sid[:8], _neutralize_delimiters(_read_capped(fp, errors="replace"))))
     return "\n\n".join(entries)
 
 def _build_page_index():
@@ -2909,7 +2919,12 @@ def _ingest_auto_batch(cfg, conn):
     # Entries rewritten since the fold READ them (a resumed session's re-record landed mid-fold)
     # stay un-ingested: their NEW content never reached any page, and the next run re-folds them
     # (merge semantics converge — the fold re-emits full page bodies).
-    fold_rows = [(sid, pp) for sid, pp in rows if _journal_mtime_ns(pp) == read_mtimes.get(sid)]
+    # `is not None` matters as much as the equality: a MISSING entry reads None at both ends, so a
+    # bare comparison marked an orphaned row ingested — claiming its content reached the pages when
+    # the fold never saw a byte of it. It stays pending (and visible in the stall count) until its
+    # journal entry is rebuilt from the transcript, which is the only thing that can honestly clear it.
+    fold_rows = [(sid, pp) for sid, pp in rows
+                 if _journal_mtime_ns(pp) is not None and _journal_mtime_ns(pp) == read_mtimes.get(sid)]
     if len(fold_rows) < len(rows):
         log("ingest auto: %d journal entr%s rewritten mid-fold — left un-ingested for re-fold"
             % (len(rows) - len(fold_rows), "y" if len(rows) - len(fold_rows) == 1 else "ies"))
