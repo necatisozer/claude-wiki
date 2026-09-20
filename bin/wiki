@@ -3184,7 +3184,9 @@ def run_lint(cfg, skip_if_unchanged=False):
     if not pages:
         log("lint: no pages to lint"); return None
     fingerprint = _lint_fingerprint(pages)
-    if skip_if_unchanged and fingerprint == _read_stamp("lint_corpus"):
+    lc = cfg.get("lint") if isinstance(cfg.get("lint"), dict) else {}
+    if (skip_if_unchanged and lc.get("skip_unchanged", True) is not False
+            and fingerprint == _read_stamp("lint_corpus")):
         log("lint --if-due: corpus unchanged since the last report — skipping the sweep "
             "(run `wiki lint` to force one)")
         return None
@@ -4338,7 +4340,11 @@ DEFAULT_CONFIG = {
                # thread's best-attested production report); topics default OFF — topic pages hold
                # durable external facts that don't decay on a timer. 0 = off. Named distinctly from
                # doctor.stale_after_days (days since last RECORD — a different clock entirely).
-               "stale_projects_days": 60, "stale_topics_days": 0},
+               "stale_projects_days": 60, "stale_topics_days": 0,
+               # false = sweep on every scheduled occurrence, even when nothing changed since the
+               # last report. The skip is the default because re-deriving an identical report costs
+               # a whole-corpus model call; turn it off if you want the weekly cadence regardless.
+               "skip_unchanged": True},
     # WP4 ROW 2 — doctor: stale-capture window (days since last record → "possibly stale" note) and a
     # per-probe timeout so a hung external tool can't wedge doctor. 0 stale_after_days disables the note.
     "doctor": {"stale_after_days": 7, "probe_timeout_seconds": 20},

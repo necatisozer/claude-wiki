@@ -133,6 +133,22 @@ make_due(W)
 run(["lint", "--if-due"], W, tripwire=TRIP)
 check("scheduled lint: a new page re-runs the sweep", TRIP.exists())
 
+# ---- (3b) lint.skip_unchanged false opts out of the skip entirely --------------------------------
+TRIP_OPT = mkdtemp("lintskip_opt_") / "calls.log"
+run(["lint"], W, tripwire=TRIP_OPT)                      # bring the fingerprint up to date
+TRIP_OPT.unlink()
+(W / "config.json").write_text(json.dumps(
+    {"enabled": True, "lint": {"enabled": True, "cron": "0 20 * * 1", "skip_unchanged": False}}))
+make_due(W)
+run(["lint", "--if-due"], W, tripwire=TRIP_OPT)
+check("skip_unchanged false: scheduled sweep runs on an unchanged corpus", TRIP_OPT.exists())
+(W / "config.json").write_text(json.dumps(
+    {"enabled": True, "lint": {"enabled": True, "cron": "0 20 * * 1"}}))
+TRIP_OPT.unlink()
+make_due(W)
+run(["lint", "--if-due"], W, tripwire=TRIP_OPT)
+check("skip_unchanged default: skipping resumes when the key is removed", not TRIP_OPT.exists())
+
 # ---- (4) a manual sweep always runs, unchanged or not --------------------------------------------
 TRIP.unlink()
 run(["lint"], W, tripwire=TRIP)

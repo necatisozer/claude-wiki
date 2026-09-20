@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`lint.skip_unchanged` (default `true`) makes the scheduled-lint skip opt-out.** 0.1.22 made the
+  skip unconditional, which was the one behavior change in that release that applied to everyone
+  with no way to decline it: a wiki that sits idle silently stopped getting its weekly sweep. The
+  default keeps the saving — re-deriving an identical report costs a whole-corpus model call — and
+  `false` restores a sweep on every scheduled occurrence. A manual `wiki lint` ignores the knob in
+  both positions, and the fingerprint is stamped either way, so flipping it back on takes effect
+  immediately rather than after one more sweep.
+
 ## [0.1.23] - 2026-09-20
 
 ### Added

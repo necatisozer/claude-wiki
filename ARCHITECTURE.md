@@ -235,7 +235,7 @@ unknown keys, wrong types, and out-of-range values are **advisory** (listed, non
 | `reconcile.enabled` | `true` | Auto crash-gap catch-up in `maintain`. |
 | `reconcile.window_days` | `14` | How far back reconcile scans (0 = no cap). |
 | `backfill.pace_seconds` | `0.5` | Delay between records during a history seed or a staged drain. |
-| `backfill.auto` | `false` | Drain the staged backlog on `backfill.cron` from `maintain`. Off = drain by hand. A sub-setting of staging: with `record.mode: "llm"` nothing is ever staged, so this key does nothing on its own. |
+| `backfill.auto` | `false` | Drain the staged backlog on `backfill.cron` from `maintain`. Off = drain by hand. |
 | `backfill.cron` | `0 20 * * *` | Drain schedule (local time, 5-field cron), used only when `auto`. |
 | `backfill.max_per_run` | `20` | Cap on staged sessions summarized per scheduled drain. |
 | `backfill.warn_backlog` | `50` | Staged backlog past this → the digest's staged banner escalates to ⚠. `0` = off. |
@@ -249,6 +249,7 @@ unknown keys, wrong types, and out-of-range values are **advisory** (listed, non
 | `ingest.max_selected_pages` | `12` | Phase-① cap on selected existing pages. |
 | `ingest.stall_threshold` | `20` | Un-ingested backlog past this → stall banner. |
 | `lint.model` | `sonnet` | Model for the weekly full-wiki lint sweep. |
+| `lint.skip_unchanged` | `true` | Skip a SCHEDULED sweep when the corpus fingerprint is unchanged. `false` = sweep on every occurrence. A manual `wiki lint` ignores this either way. |
 | `lint.cron` | `0 20 * * 1` | Lint schedule (local time). A scheduled sweep is SKIPPED when the page corpus, `SCHEMA.md` and engine version are unchanged since the last completed report (`state/lint_corpus`); a manual `wiki lint` always runs. |
 | `lint.enabled` | `true` | Enable scheduled lint. |
 | `lint.max_page_lines` | `160` | Page-length lint cap. |
