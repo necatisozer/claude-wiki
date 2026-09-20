@@ -227,6 +227,7 @@ unknown keys, wrong types, and out-of-range values are **advisory** (listed, non
 | `record.max_user_chars` | `1500` | Per-user-turn char cap in the cleaned body. |
 | `record.archive_transcripts` | `"off"` | Local raw-source durability, by scope: `"off"` / `"session"` (transcript → untracked `state/transcripts/`) / `"full"` (plus sidechains → `state/agent-transcripts/<sid>/`). `false`/`true` are legacy aliases for `"off"`/`"session"`. |
 | `record.sync_transcripts` | `false` | Cross-device tier: redacted gzip copy in tracked `transcripts/`, synced with the repo. |
+| `digest.enabled` | `true` | `false` = **capture-only**: recording, reconcile and the scheduled jobs keep running, but NOTHING is injected at SessionStart. Recall becomes purely pull (`wiki query`). Distinct from the top-level `enabled`, which turns the whole wiki off. |
 | `digest.recent_sessions` | `12` | How many recents the digest lists. |
 | `digest.max_chars` | `4000` | Hard cap on the injected digest size. |
 | `digest.max_recent_lines` | `20` | Hard cap on recent lines (backlog can't explode the digest). |

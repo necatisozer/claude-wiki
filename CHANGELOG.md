@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`digest.enabled: false` — capture-only operation.** The wiki keeps recording, reconciling and
+  running its scheduled jobs; it just stops injecting anything at SessionStart. The SessionStart
+  hook still emits a valid payload (with an empty `additionalContext`) and still fires the detached
+  compile-trigger, so `reconcile` — the thing that catches sessions the SessionEnd hook missed to a
+  crash or a power loss — keeps working. Disabling the hook itself would have taken that with it.
+  Recall becomes purely pull: `wiki query`, or read the pages directly. Distinct from the top-level
+  `enabled`, which turns the whole wiki off. `wiki status` and `wiki doctor` both state the silence
+  is deliberate, so a quiet SessionStart never reads as breakage.
+
 ## [0.1.22] - 2026-09-20
 
 ### Added

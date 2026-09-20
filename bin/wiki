@@ -1667,6 +1667,13 @@ def build_digest(cwd=None, project_scope=None):
     cfg = load_config()
     if not cfg.get("enabled", True):
         return ""
+    # `digest.enabled: false` — capture-only operation: keep recording (and reconcile, and the
+    # scheduled jobs, which the hook still triggers below) but inject NOTHING into a session. The
+    # memory keeps filling and stays readable on demand via `wiki query`; it just stops being
+    # pushed. Distinct from the top-level `enabled`, which turns the whole wiki off.
+    dgc = cfg.get("digest") if isinstance(cfg.get("digest"), dict) else {}
+    if dgc.get("enabled", True) is False:
+        return ""
     dg = cfg.get("digest") if isinstance(cfg.get("digest"), dict) else {}
     cap = int(dg.get("max_chars", 4000) or 4000)
     scoped = _digest_project_scope(cfg, project_scope)
@@ -1859,6 +1866,9 @@ def cmd_status(args):
     kv("enabled", cfg.get("enabled", True))
     kv("sync", ("armed (origin/%s)" % scfg.get("branch", "main"))
        if scfg.get("enabled") else "local-only — 'wiki init' to enable")
+    _dg = cfg.get("digest", {}) if isinstance(cfg.get("digest"), dict) else {}
+    if _dg.get("enabled", True) is False:
+        kv("digest", "OFF — nothing injected at SessionStart; recall via `wiki query`")
     kv("record mode", "%s%s" % (_record_mode(cfg),
                                 " — SessionEnd captures only; `wiki backfill --drain` summarizes"
                                 if _record_mode(cfg) == "stage" else ""))
@@ -4300,7 +4310,9 @@ DEFAULT_CONFIG = {
                # Opt-in cross-device tier: a secret-REDACTED gzip copy as a tracked
                # transcripts/<sid>.jsonl.gz, committed + pushed with the record.
                "sync_transcripts": False},
-    "digest": {"recent_sessions": 12, "max_chars": 4000, "max_recent_lines": 20,
+    # digest.enabled false = capture-only: record, reconcile and the scheduled jobs all keep
+    # running, but nothing is injected into a session. Recall becomes purely pull (`wiki query`).
+    "digest": {"enabled": True, "recent_sessions": 12, "max_chars": 4000, "max_recent_lines": 20,
                "project_scope": False},
     # WP4 ROW 1 — reconcile (auto crash-gap catch-up in `maintain`): scan sessions newer than
     # max(activated_at, last_compile), never more than window_days back (bounded). 0 = no window cap.
@@ -6158,6 +6170,9 @@ def cmd_doctor(args):
     line("last-record", bool(last_ok), (last_ok or "none recorded yet"))
     line("rec-errors", n_err == 0,
          "0" if n_err == 0 else "%d error row(s) (last %s) — reconcile retries; run: wiki status" % (n_err, last_err or "?"))
+    _dg = cfg.get("digest", {}) if isinstance(cfg.get("digest"), dict) else {}
+    if _dg.get("enabled", True) is False:   # state a deliberate silence, so it never reads as breakage
+        line("digest", True, "OFF by config — capture-only; recall with `wiki query`")
     stale = _capture_stale_days(cfg)
     line("capture", stale is None,
          "recent" if stale is None else "possibly stale — last capture %d day(s) ago" % stale)
