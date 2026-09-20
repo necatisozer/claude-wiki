@@ -62,6 +62,19 @@ A one-way flow; each stage is bounded and gated.
 6. **`pages/`** — the durable wiki (topic + project pages), the browsable/queryable nodes.
 7. **`digest`** — injected at the next SessionStart (see Recall).
 
+**Capture and summarization are separable (`record.mode`).** By default SessionEnd does both: one
+`claude -p` per session, journal entry written. Set `record.mode: "stage"` and SessionEnd only
+*captures* — clean, archive, and ledger the session as `status='staged'` with a deterministic
+skeleton description (counts, plus the first user prompt when it clears the record classifier). No
+model call. `wiki backfill --drain` — or a scheduled drain, with `backfill.auto` — summarizes the
+backlog later through the same single-session path, and `wiki record --now <sid>` jumps one session
+to the front. Staging never loses a session: the archive is written **before** any model call and
+`record.archive_transcripts` is coerced up from `"off"`, because the drain may run long after Claude
+Code deleted the original (`_bounded_lines` reads the `.gz` archive transparently, so the drain
+replays it without a special path). A staged session has no journal entry, so it is absent from the
+digest's recents and from ingest until drained; the digest carries a count-only banner instead,
+which escalates to a warning past `backfill.warn_backlog` / `warn_age_days`.
+
 **The raw-sources layer is ephemeral — the journal is the durable record.** Claude Code deletes
 session transcripts after `cleanupPeriodDays` (a Claude Code setting, not a wiki one), so a journal
 entry's `source:` path eventually dangles. After that, a page claim can only be verified against the
@@ -206,6 +219,7 @@ unknown keys, wrong types, and out-of-range values are **advisory** (listed, non
 |---|---|---|
 | `enabled` | `true` | Whole-wiki kill switch. |
 | `schema_version` | `2` | Durable data-format version; the forward-compat guard reads it. |
+| `record.mode` | `"llm"` | What SessionEnd does: `"llm"` summarizes now (one `claude -p` per session) · `"stage"` captures + archives only, no model call, and `wiki backfill --drain` summarizes later. |
 | `record.model` | `haiku` | Model for the per-session record step. |
 | `record.input_max_chars` | `60000` | Cap on cleaned-transcript chars fed to record. |
 | `record.subagent_cap` | `30` | Max subagent transcripts folded into one record. |
@@ -219,7 +233,12 @@ unknown keys, wrong types, and out-of-range values are **advisory** (listed, non
 | `digest.project_scope` | `false` | Limit recents to the active project (cross-project-bleed guard). |
 | `reconcile.enabled` | `true` | Auto crash-gap catch-up in `maintain`. |
 | `reconcile.window_days` | `14` | How far back reconcile scans (0 = no cap). |
-| `backfill.pace_seconds` | `0.5` | Delay between records during an opt-in history seed. |
+| `backfill.pace_seconds` | `0.5` | Delay between records during a history seed or a staged drain. |
+| `backfill.auto` | `false` | Drain the staged backlog on `backfill.cron` from `maintain`. Off = drain by hand. |
+| `backfill.cron` | `0 20 * * *` | Drain schedule (local time, 5-field cron), used only when `auto`. |
+| `backfill.max_per_run` | `20` | Cap on staged sessions summarized per scheduled drain. |
+| `backfill.warn_backlog` | `50` | Staged backlog past this → the digest's staged banner escalates to ⚠. `0` = off. |
+| `backfill.warn_age_days` | `14` | Oldest staged session past this → same escalation. `0` = off. |
 | `ingest.model` | `sonnet` | Model for the fold step. |
 | `ingest.mode` | `auto` | `auto` = deterministic risk gate · `review` = always stage for human accept. |
 | `ingest.cron` | `0 20 * * *` | Auto-ingest schedule (local time, 5-field cron). |
@@ -229,7 +248,7 @@ unknown keys, wrong types, and out-of-range values are **advisory** (listed, non
 | `ingest.max_selected_pages` | `12` | Phase-① cap on selected existing pages. |
 | `ingest.stall_threshold` | `20` | Un-ingested backlog past this → stall banner. |
 | `lint.model` | `sonnet` | Model for the weekly full-wiki lint sweep. |
-| `lint.cron` | `0 20 * * 1` | Lint schedule (local time). |
+| `lint.cron` | `0 20 * * 1` | Lint schedule (local time). A scheduled sweep is SKIPPED when the page corpus, `SCHEMA.md` and engine version are unchanged since the last completed report (`state/lint_corpus`); a manual `wiki lint` always runs. |
 | `lint.enabled` | `true` | Enable scheduled lint. |
 | `lint.max_page_lines` | `160` | Page-length lint cap. |
 | `lint.desc_max_chars` | `120` | Description-length lint cap. |

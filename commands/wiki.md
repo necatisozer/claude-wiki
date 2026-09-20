@@ -9,5 +9,6 @@ Common subcommands:
 - `status` — ledger + health summary
 - `ingest` / `ingest --accept` / `ingest --reject` — review-gated fold of journal → pages
 - `lint` — full-wiki health sweep → lint-report.md
+- `backfill --drain` — summarize the staged backlog (`record.mode: "stage"`); `record --now <sid>` does one now
 - `doctor` — dependency + data-repo health check
 - `reindex` — rebuild the ledger from the journal

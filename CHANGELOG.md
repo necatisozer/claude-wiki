@@ -30,6 +30,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     would have made doctor's cost quadratic in wiki age. Measured on a 673-entry journal with 651
     dangling sources: the whole sources check is 13 ms, against 106 ms for the per-lookup shape
     and 12 ms for the old `os.path.exists`-only check that answered less.
+- **`record.mode: "stage"` — capture every session without a model call on every SessionEnd.** The
+  recorder cleans, archives and ledgers the session as `status='staged'` with a DETERMINISTIC
+  skeleton description, and stops there: no `claude -p`, no journal entry. `wiki backfill --drain`
+  summarizes the backlog later through the same single-session path, `backfill.auto` + `backfill.cron`
+  drain it on a schedule from `maintain` (`backfill.max_per_run` sessions at a time), and
+  `wiki record --now <sid>` pulls one session to the front. The default stays `"llm"` — nothing
+  changes for anyone who doesn't set the key.
+- **The drain replays the ARCHIVE, not just the live transcript.** `_bounded_lines` now decompresses
+  a `.gz` path transparently, so a staged session can be summarized long after Claude Code's
+  `cleanupPeriodDays` deleted the original. Staging therefore coerces `record.archive_transcripts`
+  up from `"off"` to `"session"` (never narrowing an explicit `"full"`): deferring summarization
+  without keeping a copy is a silent data-loss machine, so that combination is not reachable.
+- **Staged-backlog surfacing, count-only.** The digest carries a `📥 N session(s) staged` line that
+  ESCALATES to `⚠ … captured but NOT summarized` past `backfill.warn_backlog` /
+  `backfill.warn_age_days` — silent decay is the failure mode of collect-only, and an authoritative-
+  looking digest describing three-week-old work is the shape it takes. `wiki status` gains a
+  `STAGED` signal and a `record mode` line; `wiki doctor` reports the backlog and its drain
+  schedule, and FAILS on the one genuine data-loss state: a staged session with neither a live
+  transcript nor an archive left.
 
 - **Subagent sidechain durability, as a new `"full"` scope on `record.archive_transcripts`.** Claude
   Code writes each subagent's work to an `agent-*.jsonl` sidechain under `<project>/<sid>/`, and
@@ -58,6 +77,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **One `_sidechain_paths()` home for Claude Code's sidechain layout**, shared by the cleaner's
   `subagents:` count and the new archive tier, so a layout change upstream cannot make the count a
   journal reports disagree with what was archived.
+
+### Fixed
+
+- **A failed `claude -p` no longer discards the raw transcript it was supposed to preserve.** Both
+  local archive tiers ran *after* the model call, inside the success path, so any record error threw
+  past them — the session was marked `status='error'` and its raw source sat unarchived until
+  `cleanupPeriodDays` deleted it, which is precisely the loss `record.archive_transcripts` exists to
+  prevent. Capture now runs **before** the model call. Security posture is unchanged where it
+  matters: the excluded-project gate still fires far earlier, these two tiers are local, untracked,
+  `0600` copies of a file already on the same disk, and the TRACKED, pushed `sync_transcripts` tier
+  deliberately stays behind the classifier verdict.
+- **The scheduled lint no longer re-sweeps an unchanged corpus.** `lint_if_due` fired the weekly
+  whole-corpus `claude -p` on the clock alone, re-deriving findings already sitting in
+  `lint-report.md` — the last real run here cost $0.86 to restate what it said the week before. The
+  scheduled path now compares a content-addressed fingerprint of everything the sweep READS (page
+  bodies + `SCHEMA.md` + engine version, so a rulebook edit or an upgrade with new checks still
+  re-lints) against `state/lint_corpus`, and skips when they match. Content-addressed rather than
+  mtime-based because a `git pull` or a restore rewrites mtimes without changing a byte. A manual
+  `wiki lint` always runs, and a sweep whose semantic review FAILED is never stamped, so a transient
+  provider error can't turn into a permanently skipped corpus. With `record.mode: "stage"` and the
+  drain left manual, this takes claude-wiki to **zero automatic `claude -p` calls**.
+
+- **A staged backlog no longer reads as a dead recorder.** `_last_capture_epoch` measured recorder
+  health by `summarized_at` alone, so under `record.mode: "stage"` — where nothing is ever
+  summarized — a perfectly healthy hook would have reported "possibly stale" forever. Staged rows
+  now count via their `first_seen`, stamped at the same moment.
 
 ## [0.1.21] - 2026-09-17
 

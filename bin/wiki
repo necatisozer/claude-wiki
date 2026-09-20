@@ -366,10 +366,31 @@ def _archive_mode(cfg):
     silent 400x disk increase."""
     v = cfg.get("record", {}).get("archive_transcripts", "off")
     if v is True:
+        v = "session"
+    elif v is False:
+        v = ""
+    v = v if v in ("session", "full") else ""
+    # record.mode "stage" defers summarization indefinitely, so the archive stops being optional:
+    # Claude Code deletes the original after cleanupPeriodDays and the drain would have nothing
+    # left to replay. Coerced HERE rather than at the call sites so the rule has one home, and
+    # upward only — an explicit "full" is never narrowed.
+    if not v and _record_mode(cfg) == "stage":
         return "session"
-    if v is False:
-        return ""
-    return v if v in ("session", "full") else ""
+    return v
+
+def _record_mode(cfg):
+    """`record.mode` — what SessionEnd does with a session:
+
+        "llm"    summarize it now (one `claude -p`) and write its journal entry — the default.
+        "stage"  capture only: clean, archive, and ledger the session with a DETERMINISTIC
+                 skeleton description and status='staged'. No model call, no journal entry.
+                 `wiki backfill` (the drain) summarizes staged sessions later, on your schedule.
+
+    Staging is the answer to "I want every session captured, but not a model call on every
+    SessionEnd". It never loses a session: the raw transcript is archived first (see
+    _archive_mode), so the drain can replay it long after Claude Code deleted the original."""
+    v = cfg.get("record", {}).get("mode", "llm")
+    return v if v in ("llm", "stage") else "llm"
 
 def _archive_transcript(tpath, sid, cfg):
     """Opt-in raw-source durability (`record.archive_transcripts`): gzip-copy the session
@@ -398,8 +419,10 @@ def _sidechain_paths(tpath, sid):
 def _archive_agent_transcripts(tpath, sid, cfg):
     """The "full" half of `record.archive_transcripts`: gzip-copy THIS session's subagent
     sidechains into the UNTRACKED state/agent-transcripts/<sid>/, same cleanup race and same
-    local-only trust class as _archive_transcript — and, because it runs from the same keep-gated
-    call site, the same classifier gate.
+    local-only trust class as _archive_transcript. Both run from the same call site, which sits
+    BEFORE the model call rather than after the classifier verdict: archival is
+    durability for a file already on this disk, and gating it on a summary that may never happen
+    (record.mode "stage") or may fail is what lost raw sources to cleanupPeriodDays.
 
     Each copy is stamped with its SOURCE's mtime, sampled before the read, which makes "unchanged"
     an exact equality rather than a newer-than guess: a sidechain appended to mid-copy leaves a
@@ -497,10 +520,21 @@ def _read_capped(fp, cap=None, errors="surrogateescape"):
 def _bounded_lines(path, cap=None, errors="replace"):
     """Yield each newline-terminated line up to `cap` chars; a longer line is DRAINED in bounded
     chunks and skipped, so a single monster JSONL line (a giant tool_result) can't OOM the detached
-    record process. Undecodable bytes never crash the read."""
+    record process. Undecodable bytes never crash the read.
+
+    A `.gz` path is decompressed transparently. That is what lets the drain (`wiki backfill`, see
+    _staged_source) replay a STAGED session from its archived copy after Claude Code's
+    cleanupPeriodDays has deleted the original — the cleaner and every other reader stay identical
+    on a live transcript and on the archive. The caps apply to the DECOMPRESSED stream, so a
+    zip-bomb archive is bounded exactly like an oversized plain transcript."""
     if cap is None:
         cap = CFG_MAX_LINE
-    with open(path, "r", errors=errors) as f:
+    if str(path).endswith(".gz"):
+        import gzip
+        opener = lambda: gzip.open(str(path), "rt", errors=errors)
+    else:
+        opener = lambda: open(path, "r", errors=errors)
+    with opener() as f:
         while True:
             chunk = f.readline(cap + 1)
             if not chunk:
@@ -762,7 +796,11 @@ def clean_transcript(path):
     """Return (header dict, cleaned_text, stats dict)."""
     header = {"sessionId": None, "cwd": None, "branch": None, "title": None,
               "started": None, "ended": None, "models": set(),
-              "tool_counts": {}, "files_touched": set(), "subagents": 0, "recall": []}
+              "tool_counts": {}, "files_touched": set(), "subagents": 0, "recall": [],
+              # First real user prompt, verbatim. Only the staged skeleton reads it (record.mode
+              # "stage" has no model output to describe a session with), and it is UNTRUSTED text —
+              # it reaches the ledger only after classify_record clears it, exactly like a body.
+              "first_user": None}
     out = []
     _acc = 0         # running char total → bound accumulation (a session of millions of msgs can't OOM)
     def add(line):
@@ -856,6 +894,8 @@ def clean_transcript(path):
                     or text.startswith("Caveat:"):
                 continue
             add("USER: " + truncate(text, CFG_USER))
+            if header["first_user"] is None:
+                header["first_user"] = text
             stats["user_prompts"] += 1
         else:  # assistant
             if msg.get("model"):
@@ -1084,6 +1124,103 @@ def _record_skip(conn, sid, project, tpath, message_count, mtime, trigger, reaso
              now_iso(), trigger, "skipped", reason))
     conn.commit()
 
+# ---------------------------------------------------------------- staging (record.mode "stage")
+def _stage_spine(stats, header):
+    """The CONTENT-FREE half of a staged session's description: engine-computed counts only, no
+    span of transcript text. Deliberately excludes the branch and file NAMES — those are
+    user-controlled strings, and this half must be safe to show even when the excerpt half was
+    rejected (that is exactly the fallback _stage_description uses)."""
+    bits = ["%d message(s)" % int(stats.get("messages", 0) or 0)]
+    if stats.get("edits"):
+        bits.append("%d edit(s)" % int(stats["edits"]))
+    n_files = len(header.get("files_touched") or ())
+    if n_files:
+        bits.append("%d file(s)" % n_files)
+    return "(staged — %s)" % ", ".join(bits)
+
+def _stage_description(header, cleaned, stats, cfg):
+    """The deterministic stand-in for the model's one-line description, for a STAGED session.
+
+    Shape: `<first user prompt, truncated> <spine>` — the prompt is what makes a staged backlog
+    browsable (and lets the drain prioritize), the spine is what makes it honest about being
+    unsummarized. The prompt is UNTRUSTED text headed for the ledger and from there into the
+    injected digest, so it clears classify_record FIRST, exactly like a model body: any
+    secret/PII, injection or leak shape and we keep the content-free spine alone. The excerpt is
+    pre-bounded so the classifier's length repair can never truncate the spine off the end."""
+    spine = _stage_spine(stats, header)
+    cap = int((cfg.get("record", {}) or {}).get("max_description_chars", 120))
+    room = cap - len(spine) - 1
+    excerpt = " ".join(((header.get("first_user") or "").strip()).split())
+    if room > 16 and excerpt:
+        cand = "%s %s" % (truncate(excerpt, room), spine)
+        verdict, reason, d = classify_record(header, cleaned, "", cand, cfg)
+        if verdict == "keep":
+            return d
+        log("stage: excerpt withheld (%s) — spine only" % reason)   # class label only, never the text
+    return spine
+
+def _stage_session(conn, sid, project, tpath, header, cleaned, stats, mtime, trigger, cfg,
+                   prev_ingested_at, prev_ingested_by):
+    """Ledger a session as CAPTURED-BUT-UNSUMMARIZED (record.mode "stage"): status='staged',
+    summarized_at/page_path NULL — the two columns every reader already uses to mean "there is a
+    journal entry for this". So a staged row is invisible to the digest recents, to ingest, and to
+    the page map, and shows up only as a count (build_digest's staged banner, `wiki status`) until
+    the drain summarizes it. INSERT OR REPLACE mirrors cmd_record's own write, carrying prior
+    ingest provenance so re-staging a resumed session cannot orphan an existing entry."""
+    ended = header.get("ended") or now_iso()
+    title = unescape_unicode(header.get("title") or "Session")
+    desc = _stage_description(header, cleaned, stats, cfg)
+    conn.execute("""INSERT OR REPLACE INTO sessions
+        (session_id,project,transcript_path,first_seen,message_count,last_mtime,
+         summarized_at,summarized_by,page_path,ingested_at,ingested_by,status,date,title,description)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (sid, project, tpath, now_iso(), stats["messages"], mtime,
+         None, trigger, None, prev_ingested_at, prev_ingested_by, "staged", ended[:10], title, desc))
+    conn.commit()
+    _oplog("stage", "%s %d msg" % (sid[:8], stats["messages"]))
+    log("record: staged", sid[:8], "(%d messages, no LLM call — drain with `wiki backfill`)"
+        % stats["messages"])
+    return 0
+
+def _staged_source(row_tpath, sid):
+    """Where the drain reads a staged session FROM, via `_resolve_transcript` — the one home for
+    "which tier holds this session". Delegating rather than checking the local archive directly
+    buys the drain the synced tier too, which is the only copy a staged session has on a second
+    device, and the freshest-wins rule instead of a fixed preference. _bounded_lines decompresses
+    `.gz` transparently, so the cleaner does not care which tier it gets. None ⇒ every tier has
+    lost it, and `wiki doctor` reports that as the one unrecoverable state staging can reach."""
+    paths, _is_gz, _tier = _resolve_transcript(sid)
+    if len(paths) == 1:
+        return paths[0]
+    return row_tpath if (row_tpath and os.path.exists(row_tpath)) else None
+
+def _ledger_transcript_path(sid):
+    """The transcript path the ledger remembers for a session, if any — the drain's starting point
+    when the caller supplied only a session id."""
+    conn = ledger()
+    try:
+        r = conn.execute("SELECT transcript_path FROM sessions WHERE session_id=?", (sid,)).fetchone()
+        return (r[0] if r else None) or None
+    finally:
+        conn.close()
+
+def _staged_rows(conn, limit=None):
+    """Staged sessions, OLDEST-FIRST — the drain order, so a backlog is worked through in the same
+    chronological order a live recorder would have produced."""
+    q = ("SELECT session_id, transcript_path, project, date FROM sessions "
+         "WHERE status='staged' ORDER BY COALESCE(date,''), first_seen")
+    if limit is not None:
+        q += " LIMIT %d" % int(limit)
+    return conn.execute(q).fetchall()
+
+def _staged_stats(conn):
+    """(count, oldest_date_or_None) for the staged backlog — the digest banner and `wiki status`
+    both read this, so a single query defines what 'the backlog' means."""
+    r = conn.execute("SELECT COUNT(*), MIN(COALESCE(date,'')) FROM sessions "
+                     "WHERE status='staged'").fetchone()
+    n = int(r[0] or 0) if r else 0
+    return n, ((r[1] or None) if r else None)
+
 # ---------------------------------------------------------------- journal writer
 def write_journal(header, body, source_path, desc=None, rel=None, ingested_flag=False):
     # WP4 ROW 4 — `rel` (an existing WIKI-relative journal path) + `ingested_flag` let a re-record of an
@@ -1234,6 +1371,14 @@ def cmd_record(args):
             return args[args.index(name) + 1] if name in args else None
         sid = opt("--session"); tpath = opt("--transcript")
         cwd = opt("--cwd"); trigger = opt("--trigger") or "manual"
+        if not sid and "--now" in args:      # ergonomic form: `wiki record --now <session-id>`
+            nxt = args[args.index("--now") + 1] if args.index("--now") + 1 < len(args) else None
+            if nxt and not nxt.startswith("-"):
+                sid = nxt
+    # `--now` summarizes THIS session immediately even under record.mode "stage" — the escape hatch
+    # for a session you don't want sitting in the backlog. The drain re-enters the same way, which
+    # is what keeps staging and summarizing one code path rather than two.
+    force_llm = "--now" in args or trigger == "drain"
     if not sid:
         log("record: no session id"); return 0
     # reentrancy: never record the engine's own ingest sessions
@@ -1259,14 +1404,25 @@ def cmd_record(args):
     if not tpath or not os.path.exists(tpath):
         tpath = find_transcript(sid, cwd)
     if not tpath or not os.path.exists(tpath):
+        # Last resort, and the drain's normal path: replay the archived copy of a staged session
+        # whose original Claude Code has since deleted (_bounded_lines reads `.gz` directly).
+        tpath = _staged_source(_ledger_transcript_path(sid), sid)
+    if not tpath or not os.path.exists(tpath):
         log("record: no transcript for", sid); return 0
 
     conn = ledger()
     with file_lock(WIKI / "state" / "record.lock"):
-        row = conn.execute("SELECT summarized_at, last_mtime, page_path, ingested_at, ingested_by "
-                           "FROM sessions WHERE session_id=?", (sid,)).fetchone()
+        row = conn.execute("SELECT summarized_at, last_mtime, page_path, ingested_at, ingested_by, "
+                           "status FROM sessions WHERE session_id=?", (sid,)).fetchone()
         if row and row[0] and row[1] is not None and int(os.path.getmtime(tpath)) <= row[1]:
             return 0   # already recorded and the transcript hasn't grown → idempotent no-op
+        # Same idempotency for a STAGED row (summarized_at is NULL by construction, so the check
+        # above cannot cover it): re-staging an unchanged session would rewrite an identical row on
+        # every SessionEnd of a resumed conversation. The drain re-enters with force_llm and is
+        # never short-circuited here.
+        if (row and row[5] == "staged" and row[1] is not None and not force_llm
+                and int(os.path.getmtime(tpath)) <= row[1]):
+            return 0
         old_page = row[2] if row else None   # else: new session, or resumed (transcript grew) → (re-)record
         # WP4 ROW 4 — provenance to preserve across a re-record: if this session was ALREADY folded into
         # pages, a re-record must NOT null out ingested_at/ingested_by (that orphans the citations and
@@ -1291,6 +1447,18 @@ def cmd_record(args):
                 _record_skip(conn, sid, project, tpath, stats["messages"], mtime, trigger, reason)
                 log("record: skipped", sid, "(%s)" % reason)
                 return 0
+            # CAPTURE BEFORE SUMMARIZE. These two tiers used to run after the model call, inside the
+            # success path, so a `claude -p` failure threw to the except below and the raw source —
+            # the very thing "raw-source durability" promises to preserve — was never archived, then
+            # deleted by cleanupPeriodDays. They are local, untracked, 0600 gzip copies of a file
+            # that is already on this disk, so running them before the classifier verdict widens no
+            # trust boundary; the excluded-project gate still fires far above, and the TRACKED
+            # (pushed) _sync_transcript tier deliberately stays behind the verdict, below.
+            _archive_transcript(tpath, sid, cfg)     # opt-in raw-source durability (local, untracked)
+            _archive_agent_transcripts(tpath, sid, cfg)   # opt-in sidechain tier (local, untracked)
+            if _record_mode(cfg) == "stage" and not force_llm:
+                return _stage_session(conn, sid, project, tpath, header, cleaned, stats, mtime,
+                                      trigger, cfg, prev_ingested_at, prev_ingested_by)
             model = cfg.get("record", {}).get("model", MODEL_DEFAULTS["record"])
             body, cost = call_claude((CODE_ROOT / "prompts" / "record.system.md").read_text(),
                                      _neutralize_delimiters(cleaned), model,
@@ -1325,8 +1493,6 @@ def cmd_record(args):
                 (sid, project, tpath, now_iso(), stats["messages"], mtime,
                  now_iso(), trigger, page, prev_ingested_at, prev_ingested_by, None, ended[:10], title, desc))
             conn.commit()
-            _archive_transcript(tpath, sid, cfg)     # opt-in raw-source durability (local, untracked)
-            _archive_agent_transcripts(tpath, sid, cfg)   # opt-in sidechain tier (local, untracked)
             _sync_transcript(tpath, sid, cfg)        # opt-in cross-device tier (redacted, tracked)
             _oplog("record", "%s %s" % (sid[:8], page))
             _record_sync_commit_push(old_page, page, slugify(title), sid)   # sync: commit+push (no-op unless enabled)
@@ -1567,6 +1733,14 @@ def build_digest(cwd=None, project_scope=None):
     if stale_days is not None:
         parts.append("⚠ **Possibly stale — last capture %d day(s) ago.** The recorder may not be "
                      "firing; run `wiki doctor`." % stale_days)
+    # STAGED banner (record.mode "stage"): a COUNT + action, never content — these sessions are
+    # captured but unsummarized, so they are deliberately absent from the recents below and this
+    # line is the only thing that says so. It ESCALATES to a warning past backfill.warn_backlog /
+    # warn_age_days, because the failure mode of collect-only is silent decay: a digest that keeps
+    # reading authoritative while the memory behind it stopped moving.
+    staged_banner = _staged_banner(cfg)
+    if staged_banner:
+        parts.append(staged_banner)
     # (4) BOUNDED TOP-LEVEL ORIENTATION — project names only (committed HEAD while held). NOT the map.
     slugs = _digest_project_slugs()
     if slugs:
@@ -1624,7 +1798,7 @@ def cmd_digest(args):
         try:
             sys.stdout.flush()
             cfg = load_config()
-            if ingest_due(cfg) or lint_due(cfg):
+            if ingest_due(cfg) or lint_due(cfg) or drain_due(cfg):
                 _spawn_detached(["maintain"])
         except Exception as e:
             log("compile-trigger: spawn failed", repr(e))
@@ -1685,11 +1859,19 @@ def cmd_status(args):
     kv("enabled", cfg.get("enabled", True))
     kv("sync", ("armed (origin/%s)" % scfg.get("branch", "main"))
        if scfg.get("enabled") else "local-only — 'wiki init' to enable")
+    kv("record mode", "%s%s" % (_record_mode(cfg),
+                                " — SessionEnd captures only; `wiki backfill --drain` summarizes"
+                                if _record_mode(cfg) == "stage" else ""))
     for job in ("ingest", "lint"):
         j = cfg.get(job, {})
         if j.get("cron"):
             kv(job + " sched", "%s %s %s" % (j["cron"], "(on)" if j.get("enabled", True) else "(off)",
                                              "" if _cron_ok(j["cron"]) else "⚠ INVALID CRON"))
+    bf = cfg.get("backfill", {}) if isinstance(cfg.get("backfill"), dict) else {}
+    if bf.get("auto") and bf.get("cron"):
+        kv("drain sched", "%s (on, max %s/run) %s"
+           % (bf["cron"], bf.get("max_per_run", 20),
+              "" if _cron_ok(bf["cron"]) else "⚠ INVALID CRON"))
     kv("journal entries", "%d%s" % (njournal, (" (+%d archived)" % narchived) if narchived else ""))
     kv("recorded (real)", total)
     kv("ledger rows", dict(rows) if rows else {})
@@ -1713,6 +1895,16 @@ def cmd_status(args):
     stale = _capture_stale_days(cfg)  # WP4 ROW 2 — recorder possibly not firing
     if stale is not None:
         signals.append("⚠ CAPTURE STALE: last record %d day(s) ago — run `wiki doctor`" % stale)
+    conn = ledger()                   # staged backlog (record.mode "stage") — count + action only
+    try:
+        n_staged, oldest_staged = _staged_stats(conn)
+    finally:
+        conn.close()
+    if n_staged:
+        age = _staged_age_days(oldest_staged)
+        signals.append("📥 STAGED       : %d session(s) captured, not summarized%s — "
+                       "run `wiki backfill --drain`"
+                       % (n_staged, (" (oldest %d day(s))" % age) if age else ""))
     if _held_file().exists():
         signals.append("⚠ INGEST HELD  : " + _held_file().read_text().strip()[:80])
         signals.append("                 resolve: review `git -C ~/.claude/wiki diff` → wiki ingest --accept | --reject")
@@ -2000,6 +2192,23 @@ def write_last_lint(ts=None):
 
 def lint_due(cfg, now=None):
     return _job_due(cfg, "lint", read_last_lint(), now or datetime.now())
+
+def read_last_drain():
+    return _read_stamp("last_drain")
+
+def write_last_drain(ts=None):
+    _write_stamp("last_drain", ts)
+
+def drain_due(cfg, now=None):
+    """Is the staged-backlog drain due? Gated on `backfill.auto` rather than an `enabled` key,
+    because backfill is a MANUAL command by default and must stay that way for anyone not using
+    record.mode "stage" — so the cron only ever fires for someone who opted in twice (staging, and
+    then automatic draining). The schedule itself is _job_due's, via a synthetic job view."""
+    bf = cfg.get("backfill") if isinstance(cfg.get("backfill"), dict) else {}
+    if not bf.get("auto", False):
+        return False
+    return _job_due({"drain": {"enabled": True, "cron": bf.get("cron", "0 20 * * *")}},
+                    "drain", read_last_drain(), now or datetime.now())
 
 # ---------------------------------------------------------------- WP3: two-phase index-first ingest
 # The whole page corpus is NEVER folded into one prompt (that was a hard context ceiling + a cost that
@@ -2937,11 +3146,38 @@ def _count_high_findings(report):
     (the prompt forbids it, but the model may slip) would double-count the same finding."""
     return len(_HIGH_SEV_RX.findall(_DET_CONFIRM_RX.sub("", report or "")))
 
-def run_lint(cfg):
-    """Full-wiki sweep: deterministic checks + LLM semantic review → lint-report.md (review-only)."""
+def _lint_fingerprint(pages):
+    """Identity of everything the semantic lint would READ: the page corpus, the rulebook it is
+    judged against (SCHEMA.md), and the engine version that supplies the deterministic findings —
+    so a rulebook edit or an engine upgrade with new checks re-lints, while an untouched wiki does
+    not. Content-addressed rather than mtime-based on purpose: a `git pull` or a restore rewrites
+    mtimes without changing a byte, and that must not buy a full-corpus model call."""
+    import hashlib
+    h = hashlib.sha256()
+    h.update(("engine:%s/%d\n" % (_manifest_version(CODE_ROOT) or "?", ENGINE_SCHEMA)).encode())
+    with contextlib.suppress(Exception):
+        h.update(b"schema:" + (CODE_ROOT / "SCHEMA.md").read_bytes())
+    for path in sorted(pages):
+        h.update(("\npage:%s\n" % path).encode())
+        h.update((pages[path].get("text") or "").encode("utf-8", "replace"))
+    return h.hexdigest()
+
+def run_lint(cfg, skip_if_unchanged=False):
+    """Full-wiki sweep: deterministic checks + LLM semantic review → lint-report.md (review-only).
+
+    `skip_if_unchanged` is the SCHEDULED path's contract: re-linting a corpus that has not changed
+    since the last report spends a full-corpus model call to re-derive findings that are already on
+    disk — pure waste on any wiki that isn't being folded into, and exactly the steady state under
+    record.mode "stage", where nothing reaches pages until you drain. A manual `wiki lint` always
+    runs: asking for it IS the reason to re-read."""
     f, pages, det_report = lint_deterministic()
     if not pages:
         log("lint: no pages to lint"); return None
+    fingerprint = _lint_fingerprint(pages)
+    if skip_if_unchanged and fingerprint == _read_stamp("lint_corpus"):
+        log("lint --if-due: corpus unchanged since the last report — skipping the sweep "
+            "(run `wiki lint` to force one)")
+        return None
     allpages = "\n\n".join("----- PAGE: %s -----\n%s" % (pg["path"], _neutralize_delimiters(pg["text"]))
                            for pg in pages.values())   # untrusted page bodies → can't forge PAGE framing
     user_input = ("=== SCHEMA.md ===\n%s\n\n=== DETERMINISTIC FINDINGS ===\n%s\n\n=== ALL WIKI PAGES ===\n%s"
@@ -2979,6 +3215,12 @@ def run_lint(cfg):
         _atomic_write(flag, str(open_n))
     elif flag.exists():
         flag.unlink()
+    # Stamp the corpus identity only when the SEMANTIC review actually ran. A failed `claude -p` is
+    # swallowed above into a deterministic-findings-only report (cost stays None) — stamping that
+    # would let the next scheduled sweep skip a corpus whose semantic review never happened, and a
+    # transient provider failure would silently become a permanent gap.
+    if cost is not None:
+        _write_stamp("lint_corpus", fingerprint)
     _oplog("lint", "%d structural finding(s)" % open_n)
     git_commit_paths("lint: weekly full-wiki sweep (%s, %d structural finding(s))" % (now_iso()[:10], open_n),
                      "lint-report.md", "log.md")
@@ -2995,7 +3237,7 @@ def lint_if_due(cfg):
             log("lint --if-due: ingest pending/held; skipping lint until resolved")
             return 0
         write_last_lint()   # stamp this cron occurrence before the slow work (prevents duplicate runs)
-        run_lint(cfg)
+        run_lint(cfg, skip_if_unchanged=True)   # an untouched corpus re-derives nothing — don't pay for it
         return 0
 
 def cmd_lint(args):
@@ -3113,6 +3355,11 @@ def _cand_needs_record(conn, cand, cfg):
     summ, last_mtime, status = row
     if status == "error":
         return True
+    # A STAGED session is captured on purpose and waits for the drain (drain_staged), which reaches
+    # it by ledger status rather than by enumeration. Re-recording it here would only re-stage it,
+    # so reconcile leaves it alone until its transcript actually grows.
+    if status == "staged" and last_mtime is not None and int(cand["mtime"]) <= last_mtime:
+        return False
     if summ and last_mtime is not None and int(cand["mtime"]) <= last_mtime:
         return False
     return True
@@ -3167,13 +3414,77 @@ def _cost_estimate(cands):
     usd = in_tokens / 1_000_000.0 * 1.0
     return total_chars, in_tokens, usd
 
+def drain_staged(cfg, limit=None, dry=False):
+    """THE DRAIN for record.mode "stage": summarize staged sessions, oldest first, one `claude -p`
+    each — the same single-session path a live record takes, re-entered with trigger "drain" so it
+    forces the model call instead of re-staging. Returns (drained, unrecoverable).
+
+    A staged row whose transcript is gone from BOTH the live store and the archive cannot be
+    summarized by anyone; it is counted, left staged (so nothing silently rewrites history) and
+    reported by `wiki doctor`, rather than marked errored — an error row would have reconcile
+    retrying it forever."""
+    conn = ledger()
+    try:
+        rows = _staged_rows(conn, limit)
+    finally:
+        conn.close()
+    if not rows:
+        return 0, 0
+    if dry:   # same semantics as the live path: the first number EXCLUDES the unrecoverable ones
+        lost = sum(1 for sid, tpath, _p, _d in rows if not _staged_source(tpath, sid))
+        return len(rows) - lost, lost
+    import time
+    try:
+        pace = float(cfg.get("backfill", {}).get("pace_seconds", 0.5) or 0)
+    except (TypeError, ValueError):
+        pace = 0.5
+    drained = lost = 0
+    for i, (sid, tpath, _project, _date) in enumerate(rows):
+        src = _staged_source(tpath, sid)
+        if not src:
+            lost += 1
+            log("drain: no source left for", sid[:8], "— staged row kept; see `wiki doctor`")
+            continue
+        cmd_record(["--session", sid, "--transcript", src, "--trigger", "drain"])
+        drained += 1
+        if pace > 0 and i + 1 < len(rows):
+            time.sleep(pace)
+    if drained or lost:
+        log("drain: summarized %d staged session(s)%s"
+            % (drained, (", %d unrecoverable" % lost) if lost else ""))
+    return drained, lost
+
+def drain_if_due(cfg):
+    """Detached drain of the staged backlog, on `backfill.cron` when `backfill.auto` is set. Same
+    shape as ingest_if_due: its own lock so two session starts can't double-drain, and the cron
+    occurrence is stamped BEFORE the slow work so a long drain doesn't re-fire. Bounded by
+    backfill.max_per_run — a backlog is worked down over several nights rather than in one burst
+    that would spend the whole day's budget at once."""
+    with _job_lock("drain.lock") as acquired:
+        if not acquired:
+            return 0
+        if not drain_due(cfg):
+            return 0
+        write_last_drain()
+        try:
+            per_run = int(cfg.get("backfill", {}).get("max_per_run", 20) or 20)
+        except (TypeError, ValueError):
+            per_run = 20
+        drained, lost = drain_staged(cfg, limit=per_run)
+        if drained:
+            log("drain --if-due: summarized %d staged session(s)" % drained)
+        return drained
+
 def cmd_backfill(args):
-    """WP4 ROW 2 — `wiki backfill`: OPT-IN seed of PAST session history (reaches back before the wiki
-    existed). Shares the enumerator with reconcile but with NO lower bound.
+    """WP4 ROW 2 — `wiki backfill`: the DRAIN for staged sessions, and an OPT-IN seed of PAST
+    session history (reaches back before the wiki existed). Staged sessions (record.mode "stage")
+    are summarized FIRST — they are already captured and waiting — then the history seed runs,
+    sharing reconcile's enumerator but with NO lower bound.
       --dry-run   list what WOULD be recorded + a ROUGH cost estimate; writes NOTHING.
       (default)   PACED (backfill.pace_seconds between records) + RESUMABLE (already-recorded sessions
                   are skipped, so a re-run only does the remainder).
-      --limit N   bound one invocation to the first N pending sessions (also aids pacing)."""
+      --limit N   bound one invocation to the first N pending sessions (also aids pacing).
+      --drain     ONLY drain the staged backlog; skip the history seed entirely."""
     if not schema_guard():
         print("backfill: refused — on-disk data is newer than this engine. Update the plugin."); return 3
     cfg = load_config()
@@ -3184,6 +3495,23 @@ def cmd_backfill(args):
     if "--limit" in args:
         try: limit = int(args[args.index("--limit") + 1])
         except Exception: limit = None
+    # ---- staged backlog first (record.mode "stage") ------------------------------------------
+    staged_n, staged_lost = drain_staged(cfg, limit, dry)
+    lost_note = (" — %d unrecoverable (no transcript and no archive), see `wiki doctor`"
+                 % staged_lost) if staged_lost else ""
+    if staged_n:
+        print("backfill: %s %d staged session(s)%s."
+              % ("WOULD summarize" if dry else "summarized", staged_n, lost_note))
+    elif staged_lost:
+        print("backfill: nothing summarizable%s." % lost_note)
+    if "--drain" in args:
+        if not staged_n and not staged_lost:
+            print("backfill --drain: nothing staged.")
+        return 0
+    if limit is not None:                    # a --limit spent on the drain is not spent twice
+        limit = max(0, limit - staged_n)
+        if limit == 0:
+            return 0
     cands = enumerate_sessions(since=None)   # ALL history — backfill's whole point
     conn = ledger()
     try:
@@ -3236,12 +3564,19 @@ def _lint_open_count_state():
         return 0
 
 def _last_capture_epoch():
-    """Epoch of the most recent successful RECORD (max summarized_at across non-error ledger rows),
-    or 0.0 when nothing has been captured yet. This is the recorder-health signal for staleness."""
+    """Epoch of the most recent successful CAPTURE, or 0.0 when nothing has been captured yet. This
+    is the recorder-health signal for staleness, so it must answer "did the hook fire?", not "did a
+    model run?" — under record.mode "stage" nothing is ever summarized and summarized_at alone would
+    report a perfectly healthy recorder as weeks stale. A staged row therefore counts via its
+    first_seen, which is stamped at the same moment summarized_at would have been."""
     conn = ledger()
     try:
-        r = conn.execute("SELECT MAX(summarized_at) FROM sessions WHERE summarized_at IS NOT NULL "
-                         "AND (status IS NULL OR status != 'error')").fetchone()
+        r = conn.execute(
+            "SELECT MAX(ts) FROM ("
+            "  SELECT MAX(summarized_at) AS ts FROM sessions WHERE summarized_at IS NOT NULL "
+            "    AND (status IS NULL OR status != 'error') "
+            "  UNION ALL "
+            "  SELECT MAX(first_seen) AS ts FROM sessions WHERE status='staged')").fetchone()
     except Exception:
         return 0.0
     finally:
@@ -3268,6 +3603,47 @@ def _capture_stale_days(cfg):
         return None                      # nothing captured yet → empty, not stale
     days = int((time.time() - last) // 86400)
     return days if days > window else None
+
+def _staged_age_days(oldest_date):
+    """Whole days since the oldest staged session's date ('YYYY-MM-DD'), or 0 when unparseable."""
+    if not oldest_date:
+        return 0
+    try:
+        d = datetime.strptime(oldest_date[:10], "%Y-%m-%d")
+    except Exception:
+        return 0
+    return max(0, (datetime.now() - d).days)
+
+def _staged_banner(cfg):
+    """The digest's staged line, or '' when nothing is staged. Neutral COUNT + action by default;
+    escalates to ⚠ once the backlog passes backfill.warn_backlog or its oldest entry passes
+    backfill.warn_age_days (either 0 disables that half of the escalation). Content-free by
+    construction — a count and a number of days, never a session's text."""
+    conn = ledger()
+    try:
+        n, oldest = _staged_stats(conn)
+    except Exception:
+        return ""
+    finally:
+        conn.close()
+    if n <= 0:
+        return ""
+    bf = cfg.get("backfill") if isinstance(cfg.get("backfill"), dict) else {}
+    def _int(key, dflt):
+        try:
+            return int(bf.get(key, dflt) or 0)
+        except (TypeError, ValueError):
+            return dflt
+    age = _staged_age_days(oldest)
+    warn_n, warn_age = _int("warn_backlog", 50), _int("warn_age_days", 14)
+    loud = (warn_n > 0 and n >= warn_n) or (warn_age > 0 and age >= warn_age)
+    tail = " (oldest %d day(s) ago)" % age if age else ""
+    if loud:
+        return ("⚠ **%d session(s) captured but NOT summarized%s.** This memory has stopped "
+                "growing — the recents below are older than your work. Drain with "
+                "`/wiki backfill --drain`." % (n, tail))
+    return ("📥 **%d session(s) staged, awaiting summary%s** — captured in full; run "
+            "`/wiki backfill --drain` to fold them in." % (n, tail))
 
 def _pending_ingest_count():
     """The un-ingested backlog: recorded sessions not yet folded into any page (ingested_at IS NULL),
@@ -3311,6 +3687,7 @@ def cmd_maintain(args):
         if not schema_guard():   # v0.1.5 (integrity-audit I1): the pull may have just delivered a
             return 3             # NEWER config.json from an upgraded device — re-check before compiling
         reconcile_sessions(cfg)   # WP4 ROW 1: catch missed/errored sessions BEFORE ingest folds them
+        drain_if_due(cfg)      # record.mode "stage": summarize the staged backlog, also before ingest
         ingest_if_due(cfg)     # daily
         lint_if_due(cfg)       # weekly (lints the freshly-ingested state)
         _journal_retention(cfg)   # S3: archive ingested journal entries older than archive_after_days
@@ -3907,6 +4284,10 @@ DEFAULT_CONFIG = {
     "schema_version": ENGINE_SCHEMA,   # stamped at init; the WP4 forward-compat guard reads it
     "record": {"model": MODEL_DEFAULTS["record"], "effort": EFFORT_DEFAULTS["record"], "input_max_chars": 60000, "subagent_cap": 30,
                "max_assistant_chars": 1200, "max_user_chars": 1500,
+               # What SessionEnd does with a session (see _record_mode):
+               #   "llm"   — summarize now, write the journal entry (one `claude -p` per session)
+               #   "stage" — capture + archive only, no model call; `wiki backfill` drains later
+               "mode": "llm",
                # Opt-in raw-source durability, HOW MUCH of it to keep (Claude Code deletes the
                # originals after cleanupPeriodDays). Local only — never synced.
                #   false     — keep nothing
@@ -3926,7 +4307,12 @@ DEFAULT_CONFIG = {
     "reconcile": {"enabled": True, "window_days": 14},
     # WP4 ROW 2 — `wiki backfill` (opt-in history seed): pace between records so a big seed doesn't
     # hammer the API. 0 = no delay.
-    "backfill": {"pace_seconds": 0.5},
+    # It is also the DRAIN for record.mode "stage": `auto` lets `maintain` drain the staged backlog
+    # on `cron` (max_per_run sessions at a time, oldest first); leave it false to drain by hand.
+    # warn_backlog / warn_age_days set when the digest escalates its staged banner from a neutral
+    # count to a staleness warning — 0 disables that escalation.
+    "backfill": {"pace_seconds": 0.5, "auto": False, "cron": "0 20 * * *", "max_per_run": 20,
+                 "warn_backlog": 50, "warn_age_days": 14},
     "ingest": {"model": MODEL_DEFAULTS["ingest"], "effort": EFFORT_DEFAULTS["ingest"], "mode": "auto", "cron": "0 20 * * *", "enabled": True,
                "max_sessions_per_run": 50, "auto_max_batches": 4, "max_selected_pages": 12,
                "max_dropped_threads": 2,
@@ -5229,11 +5615,14 @@ CONFIG_CONSTRAINTS = {
     "record.archive_transcripts": {"off", "session", "full", False, True},
     **{"%s.effort" % st: {"", "inherit", "low", "medium", "high", "xhigh", "max"}
        for st in ("record", "ingest", "lint")},       # enum — "" / "inherit" omit --effort
+    "record.mode": {"llm", "stage"},                   # enum — see _record_mode
     "record.input_max_chars": (1, None), "record.subagent_cap": (0, None),
     "record.max_assistant_chars": (1, None), "record.max_user_chars": (1, None),
     "digest.recent_sessions": (0, None), "digest.max_chars": (1, None),
     "digest.max_recent_lines": (0, None),
     "reconcile.window_days": (0, None), "backfill.pace_seconds": (0, None),
+    "backfill.max_per_run": (1, None), "backfill.warn_backlog": (0, None),
+    "backfill.warn_age_days": (0, None),
     "ingest.max_sessions_per_run": (1, None), "ingest.max_dropped_threads": (0, None), "ingest.auto_max_batches": (1, None),
     "ingest.max_selected_pages": (1, None), "ingest.stall_threshold": (0, None),
     "lint.max_page_lines": (1, None), "lint.desc_max_chars": (1, None),
@@ -5382,6 +5771,27 @@ def _doctor_record_health():
     finally:
         conn.close()
     return last_ok, int(n_err or 0), last_err
+
+def _doctor_staged_health():
+    """(staged_count, oldest_staged_date, unrecoverable_count) for record.mode "stage".
+    `unrecoverable` counts staged sessions with neither a live transcript nor an archive — the only
+    state in which a captured session is genuinely unrecoverable, which is why it is the part that
+    fails doctor. Content-free: counts and a date."""
+    conn = ledger()
+    try:
+        n, oldest = _staged_stats(conn)
+        rows = _staged_rows(conn)
+    except Exception:
+        return 0, None, 0
+    finally:
+        conn.close()
+    # ONE index over every tier, then membership per row — not _staged_source (and its own index
+    # build) per staged session, which is the per-lookup shape _transcript_index exists to avoid
+    # and would make this check quadratic in the size of the backlog.
+    idx = _transcript_index()
+    lost = sum(1 for sid, tpath, _p, _d in rows
+               if sid not in idx and not (tpath and os.path.exists(tpath)))
+    return n, oldest, lost
 
 def _dangling_sources():
     """(total, dangling, archived) over the hot journal's `source:` transcript paths. Claude Code
@@ -5751,6 +6161,21 @@ def cmd_doctor(args):
     stale = _capture_stale_days(cfg)
     line("capture", stale is None,
          "recent" if stale is None else "possibly stale — last capture %d day(s) ago" % stale)
+    # record.mode "stage" — the staged backlog and, CRITICALLY, whether each staged session can
+    # still be summarized at all. A staged row whose live transcript AND archive are both gone is
+    # the one true data-loss state this mode can reach, so it is the only part that fails doctor.
+    n_staged, oldest, lost = _doctor_staged_health()
+    if _record_mode(cfg) == "stage" or n_staged:
+        age = _staged_age_days(oldest)
+        bf = cfg.get("backfill", {}) if isinstance(cfg.get("backfill"), dict) else {}
+        drain_how = "auto (%s)" % bf.get("cron", "?") if bf.get("auto") else "manual"
+        line("staged", True, "%d awaiting summary%s · drain: %s"
+             % (n_staged, (" (oldest %d day(s))" % age) if age else "", drain_how))
+        line("staged-src", lost == 0,
+             "every staged session still has a replayable source" if lost == 0 else
+             "%d staged session(s) have NO transcript and NO archive — they can no longer be "
+             "summarized; set record.archive_transcripts before staging more" % lost,
+             critical=True)
     # WP5 (S9) — transcript-format drift: surface the cleaner's unknown-type tally so a Claude Code
     # transcript-format change becomes visible here instead of silently degrading capture. Advisory.
     drift = _read_drift()

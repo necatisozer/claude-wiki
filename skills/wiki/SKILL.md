@@ -81,6 +81,10 @@ form would not match the copied allow-rules and prompts every time). Written `wi
   when the risk gate holds a batch) it **stages for review**; then `wiki ingest --accept` (commit) or
   `--reject` (discard).
 - `wiki lint` — run the full-wiki sweep now → `lint-report.md`.
+- `wiki backfill --drain` — summarize the **staged** backlog (only relevant under
+  `record.mode: "stage"`, where SessionEnd captures sessions without summarizing them). Add
+  `--limit N` to bound a run, `--dry-run` to see what it would do. `wiki record --now <session-id>`
+  summarizes one staged session immediately instead of waiting for the drain.
 - `wiki reindex` — rebuild ledger rows from the journal (recovery after a lost/rebuilt `state/`).
 - `wiki index` — regenerate `index.md` (rarely needed; ingest does it).
 
